@@ -308,6 +308,11 @@ CCFLAGS=$(CCFLAGS) $(INCLUDEDIRS)
 
 ALL: $(PROG) $(PROGSTATIC) $(DLLS) $(PROPS)
 
+# Native assistant headers are shared by multiple translation units.
+$(AIOBJS): ai\GusekAiDef.h ai\GusekAiConfig.h ai\GusekAiProtocol.h \
+    ai\GusekAiPane.h ai\GusekAiModel.h ai\GusekAiDownload.h ai\GusekAiHttp.h \
+    ai\GusekAiHost.h ai\GusekAiImage.h ai\GusekAiRender.h
+
 clean:
 	del /q $(DIR_BIN)\*.exe *.o *.obj $(DIR_BIN)\*.dll *.res *.map $(DIR_BIN)\*.exp $(DIR_BIN)\*.lib $(DIR_BIN)\*.pdb
 

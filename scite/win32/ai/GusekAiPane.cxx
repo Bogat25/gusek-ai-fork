@@ -1,4 +1,5 @@
 #include "GusekAiPane.h"
+#include "GusekAiHttp.h"
 #include <commdlg.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -8,6 +9,12 @@
 
 static const wchar_t PANE_CLASS_NAME[] = L"GusekAiPaneClass";
 
+struct AiWorkerEvent {
+    LONG generation;
+    bool success;
+    std::string text;
+};
+
 GusekAiPane::GusekAiPane(IGusekAiHost *pHost)
     : m_pHost(pHost),
       m_hWnd(NULL), m_hStatus(NULL), m_hHist(NULL), m_hInput(NULL),
@@ -15,8 +22,9 @@ GusekAiPane::GusekAiPane(IGusekAiHost *pHost)
       m_btnNew(NULL), m_btnAttach(NULL),
       m_hFontUi(NULL), m_hMsftEdit(NULL),
       m_busy(false), m_cancel(0), m_downloading(0), m_mouseDragging(false),
-      m_currentTurnStartPos(0), m_postPending(0),
-      m_hWorkerThread(NULL), m_workerSocket(INVALID_SOCKET)
+      m_currentTurnStartPos(0), m_generation(0),
+      m_cancelEvent(CreateEvent(NULL, TRUE, FALSE, NULL)), m_postPending(0),
+      m_hWorkerThread(NULL), m_hDownloadThread(NULL)
 {
     InitializeCriticalSection(&m_cs);
     GusekAiImage::Initialize();
@@ -25,6 +33,7 @@ GusekAiPane::GusekAiPane(IGusekAiHost *pHost)
 GusekAiPane::~GusekAiPane() {
     Destroy();
     GusekAiImage::Shutdown();
+    if (m_cancelEvent) CloseHandle(m_cancelEvent);
     DeleteCriticalSection(&m_cs);
 }
 
@@ -41,9 +50,9 @@ bool GusekAiPane::Create(HWND hParent, int x, int y, int width, int height) {
     }
 
     // Load config
-    char exePath[MAX_PATH];
-    GetModuleFileNameA(NULL, exePath, MAX_PATH);
-    std::string appDir = exePath;
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::string appDir = WideToUtf8(exePath);
     size_t lastSlash = appDir.find_last_of("/\\");
     if (lastSlash != std::string::npos) appDir = appDir.substr(0, lastSlash);
     m_config.Load(appDir);
@@ -121,6 +130,8 @@ bool GusekAiPane::Create(HWND hParent, int x, int y, int width, int height) {
 }
 
 void GusekAiPane::Destroy() {
+    OnHostQuit();
+    ClearAttachedImages();
     if (m_hWnd) {
         DestroyWindow(m_hWnd);
         m_hWnd = NULL;
@@ -263,6 +274,9 @@ void GusekAiPane::AttachClipboardImage() {
 }
 
 void GusekAiPane::ClearAttachedImages() {
+    for (size_t i = 0; i < m_attachedImages.size(); ++i) {
+        if (m_attachedImages[i].hThumb) DeleteObject(m_attachedImages[i].hThumb);
+    }
     m_attachedImages.clear();
     SetStatus("Attached pictures removed");
 }
@@ -299,10 +313,13 @@ void GusekAiPane::InsertCodeToEditor() {
     }
     std::string code;
     if (GusekAiProtocol::ExtractFencedCode(m_lastAnswer, code) && !code.empty()) {
-        if (!m_pHost->InsertTextAtCaret(code.c_str())) {
-            m_pHost->CreateNewMathProgDocument(code.c_str());
+        if (m_pHost->InsertTextAtCaret(code.c_str())) {
+            SetStatus("Code inserted to editor");
+        } else if (m_pHost->CreateNewMathProgDocument(code.c_str())) {
+            SetStatus("Code opened in a new UTF-8 document");
+        } else {
+            SetStatus("Code could not be inserted");
         }
-        SetStatus("Code inserted to editor");
     } else {
         SetStatus("No code block found in last answer");
     }
@@ -310,8 +327,9 @@ void GusekAiPane::InsertCodeToEditor() {
 
 void GusekAiPane::NewChat() {
     StopWork();
+    ++m_generation;
     m_history.clear();
-    m_attachedImages.clear();
+    ClearAttachedImages();
     m_lastAnswer.clear();
     m_currentStreamingReply.clear();
     SetWindowTextW(m_hHist, L"");
@@ -319,19 +337,55 @@ void GusekAiPane::NewChat() {
     SetStatus("Ready");
 }
 
+void GusekAiPane::JoinWorkers() {
+    HANDLE *threads[] = { &m_hWorkerThread, &m_hDownloadThread };
+    for (int i = 0; i < 2; ++i) {
+        if (*threads[i]) {
+            // Workers only post messages; they never wait for the UI thread.
+            WaitForSingleObject(*threads[i], INFINITE);
+            CloseHandle(*threads[i]);
+            *threads[i] = NULL;
+        }
+    }
+}
+
+void GusekAiPane::DiscardWorkerMessages() {
+    if (!m_hWnd) return;
+    MSG msg;
+    while (PeekMessage(&msg, m_hWnd, WM_AI_DATA, WM_AI_OFFER_DOWNLOAD, PM_REMOVE)) {
+        if (msg.message != WM_AI_DATA) delete reinterpret_cast<AiWorkerEvent *>(msg.lParam);
+    }
+}
+
+void GusekAiPane::PostWorkerMessage(UINT message, LONG generation, bool success,
+                                   const std::string &text) {
+    AiWorkerEvent *event = new AiWorkerEvent();
+    event->generation = generation;
+    event->success = success;
+    event->text = text;
+    if (!PostMessage(m_hWnd, message, 0, reinterpret_cast<LPARAM>(event))) delete event;
+}
+
 void GusekAiPane::StopWork() {
     InterlockedExchange(&m_cancel, 1);
-    if (m_workerSocket != INVALID_SOCKET) {
-        closesocket(m_workerSocket);
-        m_workerSocket = INVALID_SOCKET;
-    }
+    if (m_cancelEvent) SetEvent(m_cancelEvent);
+    JoinWorkers();
+    DiscardWorkerMessages();
+    if (m_busy) FinishTurn(false);
+    InterlockedExchange(&m_downloading, 0);
+    EnableWindow(m_btnSend, TRUE);
+    EnableWindow(m_btnStop, FALSE);
     SetStatus("Stopped");
 }
 
 struct WorkerThreadParams {
     GusekAiPane *pPane;
+    LONG generation;
+    GusekAiConfig config;
     std::string question;
-    std::vector<ChatImageAttachment> images;
+    std::string documentDir;
+    std::vector<ChatMessage> history;
+    std::vector<std::string> images;
 };
 
 void GusekAiPane::SendQuestion() {
@@ -383,8 +437,12 @@ void GusekAiPane::SendQuestion() {
     GETTEXTLENGTHEX gtlHist = { GTL_NUMCHARS | GTL_PRECISE, 1200 };
     m_currentTurnStartPos = (LONG)SendMessage(m_hHist, EM_GETTEXTLENGTHEX, (WPARAM)&gtlHist, 0);
 
+    JoinWorkers();
+    DiscardWorkerMessages();
+    ++m_generation;
     m_busy = true;
-    m_cancel = 0;
+    InterlockedExchange(&m_cancel, 0);
+    ResetEvent(m_cancelEvent);
     m_currentStreamingReply.clear();
     EnableWindow(m_btnSend, FALSE);
     EnableWindow(m_btnStop, TRUE);
@@ -392,159 +450,117 @@ void GusekAiPane::SendQuestion() {
 
     WorkerThreadParams *params = new WorkerThreadParams();
     params->pPane = this;
+    params->generation = m_generation;
+    params->config = m_config;
     params->question = q;
-    params->images = m_attachedImages;
+    params->history = m_history;
+    // Read mutable host document state on the UI thread.
+    params->documentDir = m_pHost->GetActiveDocumentPath();
+    size_t slash = params->documentDir.find_last_of("/\\");
+    params->documentDir = slash == std::string::npos ? "" : params->documentDir.substr(0, slash);
+    for (size_t i = 0; i < m_attachedImages.size(); ++i) {
+        params->images.push_back(m_attachedImages[i].base64Png);
+    }
+    m_pendingQuestion.role = "user";
+    m_pendingQuestion.content = q;
+    m_pendingQuestion.imageDataUrls = params->images;
+    ClearAttachedImages();
 
     m_hWorkerThread = CreateThread(NULL, 0, WorkerThreadProc, params, 0, NULL);
+    if (!m_hWorkerThread) {
+        delete params;
+        FinishTurn(false);
+        SetStatus("Could not start the assistant worker");
+    }
 }
 
 DWORD WINAPI GusekAiPane::WorkerThreadProc(LPVOID lpParam) {
-    WorkerThreadParams *p = (WorkerThreadParams *)lpParam;
+    WorkerThreadParams *p = static_cast<WorkerThreadParams *>(lpParam);
     GusekAiPane *pane = p->pPane;
-
-    // Check if model file exists
-    DWORD modAttr = GetFileAttributesA(pane->m_config.resolved_model.c_str());
-    if (modAttr == INVALID_FILE_ATTRIBUTES || (modAttr & FILE_ATTRIBUTE_DIRECTORY)) {
-        PostMessage(pane->m_hWnd, WM_AI_OFFER_DOWNLOAD, 0, 0);
-        delete p;
-        return 0;
-    }
-
-    // 1. Ensure model server is running
-    PostMessage(pane->m_hWnd, WM_AI_STATUS, 0, (LPARAM)_strdup("Loading model..."));
-    std::string srvErr;
-    if (!pane->m_model.EnsureRunning(pane->m_config, srvErr)) {
-        std::string err = "Model error: " + srvErr;
-        PostMessage(pane->m_hWnd, WM_AI_STATUS, 0, (LPARAM)_strdup(err.c_str()));
-        PostMessage(pane->m_hWnd, WM_AI_DONE, 0, 0);
-        delete p;
-        return 0;
-    }
-
-    if (pane->m_cancel) {
-        PostMessage(pane->m_hWnd, WM_AI_DONE, 0, 0);
-        delete p;
-        return 0;
-    }
-
-    PostMessage(pane->m_hWnd, WM_AI_STATUS, 0, (LPARAM)_strdup("Answering..."));
-
-    // 2. Build JSON Request
-    std::string docPath = pane->m_pHost->GetActiveDocumentPath();
-    std::string docDir = docPath;
-    size_t lastSlash = docDir.find_last_of("/\\");
-    if (lastSlash != std::string::npos) docDir = docDir.substr(0, lastSlash); else docDir = "";
-
-    std::string sysPrompt = pane->m_config.GetSystemPrompt() + pane->m_config.GetCourseContext(p->question, docDir);
-
-    std::vector<std::string> curImgUrls;
-    for (size_t i = 0; i < p->images.size(); i++) {
-        curImgUrls.push_back(p->images[i].base64Png);
-    }
-
-    std::string reqBody = GusekAiProtocol::BuildChatRequestJson(
-        sysPrompt, pane->m_history, p->question, curImgUrls, pane->m_config);
-
-    // 3. Connect loopback socket
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    pane->m_workerSocket = s;
-
-    sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)pane->m_config.port);
-    addr.sin_addr.s_addr = inet_addr(pane->m_config.host.c_str());
-
-    if (connect(s, (sockaddr *)&addr, sizeof(addr)) != 0) {
-        closesocket(s);
-        pane->m_workerSocket = INVALID_SOCKET;
-        WSACleanup();
-        PostMessage(pane->m_hWnd, WM_AI_STATUS, 0, (LPARAM)_strdup("Connection to local model server failed"));
-        PostMessage(pane->m_hWnd, WM_AI_DONE, 0, 0);
-        delete p;
-        return 0;
-    }
-
-    std::string httpReq = "POST /v1/chat/completions HTTP/1.1\r\n";
-    httpReq += "Host: " + pane->m_config.host + ":" + std::to_string(pane->m_config.port) + "\r\n";
-    httpReq += "Content-Type: application/json\r\n";
-    httpReq += "Content-Length: " + std::to_string(reqBody.length()) + "\r\n";
-    httpReq += "Connection: close\r\n\r\n";
-    httpReq += reqBody;
-
-    send(s, httpReq.c_str(), (int)httpReq.length(), 0);
-
-    // 4. Stream response
-    char recvBuf[4096];
-    std::string sseLineBuffer;
-    ThinkTagFilter thinkFilter;
+    const LONG generation = p->generation;
+    const GusekAiConfig &config = p->config;
     bool done = false;
+    std::string error;
 
-    // Skip HTTP headers
-    std::string headerAccum;
-    bool headersDone = false;
+    DWORD attr = GetFileAttributesW(Utf8ToWide(config.resolved_model).c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        pane->PostWorkerMessage(WM_AI_OFFER_DOWNLOAD, generation, false);
+        delete p;
+        return 0;
+    }
 
-    while (!pane->m_cancel && !done) {
-        int rec = recv(s, recvBuf, sizeof(recvBuf) - 1, 0);
-        if (rec <= 0) break;
-        recvBuf[rec] = '\0';
+    pane->PostWorkerMessage(WM_AI_STATUS, generation, true, "Loading model...");
+    if (!pane->m_model.EnsureRunning(config, error, pane->m_cancelEvent)) {
+        pane->PostWorkerMessage(WM_AI_DONE, generation, false, "Model error: " + error);
+        delete p;
+        return 0;
+    }
 
-        if (!headersDone) {
-            headerAccum.append(recvBuf, rec);
-            size_t dnl = headerAccum.find("\r\n\r\n");
-            if (dnl != std::string::npos) {
-                headersDone = true;
-                std::string bodyStart = headerAccum.substr(dnl + 4);
-                sseLineBuffer.append(bodyStart);
-            }
+    {
+        std::string sysPrompt = config.GetSystemPrompt() +
+            config.GetCourseContext(p->question, p->documentDir);
+        std::string body = GusekAiProtocol::BuildChatRequestJson(
+            sysPrompt, p->history, p->question, p->images, config);
+        DWORD timeoutMs = static_cast<DWORD>((std::max)(1, (std::min)(config.request_timeout, 86400))) * 1000;
+        GusekAiHttpRequest http(pane->m_cancelEvent, &pane->m_cancel, timeoutMs);
+        DWORD status = 0;
+        if (!http.Open(Utf8ToWide(config.host), static_cast<INTERNET_PORT>(config.port),
+                       L"POST", L"/v1/chat/completions") ||
+            !http.Send(L"Content-Type: application/json\r\n", body) || !http.Receive()) {
+            error = "Request failed (Windows error " + std::to_string(http.Error()) + ")";
+        } else if (!http.Status(status) || status != 200) {
+            error = "Model server returned HTTP status " + std::to_string(status);
         } else {
-            sseLineBuffer.append(recvBuf, rec);
-        }
-
-        if (headersDone) {
-            // Process complete lines
-            size_t nl;
-            while ((nl = sseLineBuffer.find('\n')) != std::string::npos) {
-                std::string line = sseLineBuffer.substr(0, nl);
-                sseLineBuffer.erase(0, nl + 1);
-
-                std::string deltaText;
-                bool isDone = false;
-                if (GusekAiProtocol::ParseSseDelta(line.c_str(), deltaText, isDone)) {
-                    std::string filtered = thinkFilter.FilterChunk(deltaText.c_str(), deltaText.length());
-                    if (!filtered.empty()) {
-                        EnterCriticalSection(&pane->m_cs);
-                        pane->m_pendingBuffer += filtered;
-                        LeaveCriticalSection(&pane->m_cs);
-
-                        if (InterlockedCompareExchange(&pane->m_postPending, 1, 0) == 0) {
-                            PostMessage(pane->m_hWnd, WM_AI_DATA, 0, 0);
-                        }
-                    }
-                }
-                if (isDone) {
-                    done = true;
+            pane->PostWorkerMessage(WM_AI_STATUS, generation, true, "Answering...");
+            char buffer[8192];
+            std::string lines;
+            ThinkTagFilter filter;
+            while (!http.IsCancelled() && !done) {
+                DWORD size = 0;
+                if (!http.Read(buffer, sizeof(buffer), size)) {
+                    error = "Stream failed (Windows error " + std::to_string(http.Error()) + ")";
                     break;
                 }
+                if (!size) break;
+                lines.append(buffer, size);
+                if (lines.size() > 1024 * 1024) {
+                    error = "Model server sent an oversized event";
+                    break;
+                }
+                size_t nl;
+                while ((nl = lines.find('\n')) != std::string::npos) {
+                    std::string line = lines.substr(0, nl);
+                    lines.erase(0, nl + 1);
+                    std::string delta;
+                    bool isDone = false;
+                    if (GusekAiProtocol::ParseSseDelta(line.c_str(), delta, isDone)) {
+                        std::string text = config.strip_think ?
+                            filter.FilterChunk(delta.c_str(), delta.size()) : delta;
+                        if (!text.empty()) {
+                            EnterCriticalSection(&pane->m_cs);
+                            pane->m_pendingBuffer += text;
+                            LeaveCriticalSection(&pane->m_cs);
+                            if (InterlockedCompareExchange(&pane->m_postPending, 1, 0) == 0)
+                                PostMessage(pane->m_hWnd, WM_AI_DATA, generation, 0);
+                        }
+                    }
+                    if (isDone) { done = true; break; }
+                }
             }
+            std::string tail = config.strip_think ? filter.Flush() : "";
+            if (!tail.empty()) {
+                EnterCriticalSection(&pane->m_cs);
+                pane->m_pendingBuffer += tail;
+                LeaveCriticalSection(&pane->m_cs);
+            }
+            if (!done && error.empty()) error = "Model stream ended before completion";
         }
+    } // Close the asynchronous request and await its last callback before DONE.
+    if (InterlockedCompareExchange(&pane->m_cancel, 0, 0)) {
+        done = false;
+        error = "Stopped";
     }
-
-    std::string rem = thinkFilter.Flush();
-    if (!rem.empty()) {
-        EnterCriticalSection(&pane->m_cs);
-        pane->m_pendingBuffer += rem;
-        LeaveCriticalSection(&pane->m_cs);
-    }
-
-    closesocket(s);
-    pane->m_workerSocket = INVALID_SOCKET;
-    WSACleanup();
-
-    PostMessage(pane->m_hWnd, WM_AI_DONE, done ? 1 : 0, 0);
+    pane->PostWorkerMessage(WM_AI_DONE, generation, done, error);
     delete p;
     return 0;
 }
@@ -570,6 +586,18 @@ void GusekAiPane::FinishTurn(bool success) {
     GusekAiRender::RenderMarkdownStream(m_hHist, m_currentStreamingReply, m_currentTurnStartPos, true);
 
     m_lastAnswer = m_currentStreamingReply;
+    if (success) {
+        ChatMessage answer;
+        answer.role = "assistant";
+        answer.content = m_lastAnswer;
+        m_history.push_back(m_pendingQuestion);
+        m_history.push_back(answer);
+        size_t limit = static_cast<size_t>((std::max)(0, m_config.keep_history));
+        limit -= limit % 2; // Keep complete user/assistant pairs.
+        if (m_history.size() > limit)
+            m_history.erase(m_history.begin(), m_history.end() - limit);
+    }
+    m_pendingQuestion = ChatMessage();
 
     m_busy = false;
     EnableWindow(m_btnSend, TRUE);
@@ -587,12 +615,20 @@ void GusekAiPane::TriggerFirstRunDownload(bool isVisionOnly) {
     }
 
     if (MessageBoxW(m_hWnd, msg.c_str(), L"Download Local AI Model", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-        m_downloading = 1;
-        m_cancel = 0;
+        JoinWorkers();
+        DiscardWorkerMessages();
+        ++m_generation;
+        InterlockedExchange(&m_downloading, 1);
+        InterlockedExchange(&m_cancel, 0);
+        ResetEvent(m_cancelEvent);
         EnableWindow(m_btnSend, FALSE);
         EnableWindow(m_btnStop, TRUE);
         SetStatus("Starting download...");
-        CreateThread(NULL, 0, DownloadThreadProc, this, 0, NULL);
+        m_hDownloadThread = CreateThread(NULL, 0, DownloadThreadProc, this, 0, NULL);
+        if (!m_hDownloadThread) {
+            HandleDownloadDone(false);
+            SetStatus("Could not start the download worker");
+        }
     } else {
         SetStatus("Download declined. Model assistant unavailable.");
     }
@@ -601,7 +637,11 @@ void GusekAiPane::TriggerFirstRunDownload(bool isVisionOnly) {
 static void OnDownloadProgress(unsigned __int64 downloaded, unsigned __int64 total, const char *statusMsg, void *userData) {
     GusekAiPane *pane = (GusekAiPane *)userData;
     if (statusMsg) {
-        PostMessage(pane->GetHWND(), WM_AI_STATUS, 0, (LPARAM)_strdup(statusMsg));
+        AiWorkerEvent *event = new AiWorkerEvent();
+        event->generation = 0; // Download progress is checked against the active download.
+        event->success = true;
+        event->text = statusMsg;
+        if (!PostMessage(pane->GetHWND(), WM_AI_STATUS, 0, reinterpret_cast<LPARAM>(event))) delete event;
     }
 }
 
@@ -617,7 +657,8 @@ DWORD WINAPI GusekAiPane::DownloadThreadProc(LPVOID lpParam) {
         &pane->m_cancel,
         OnDownloadProgress,
         pane,
-        err);
+        err,
+        pane->m_cancelEvent);
 
     if (ok && pane->m_config.vision) {
         ok = GusekAiDownload::DownloadWithResume(
@@ -628,15 +669,17 @@ DWORD WINAPI GusekAiPane::DownloadThreadProc(LPVOID lpParam) {
             &pane->m_cancel,
             OnDownloadProgress,
             pane,
-            err);
+            err,
+            pane->m_cancelEvent);
     }
 
-    PostMessage(pane->GetHWND(), WM_AI_DLDONE, ok ? 1 : 0, (LPARAM)(err.empty() ? NULL : _strdup(err.c_str())));
+    pane->PostWorkerMessage(WM_AI_DLDONE, pane->m_generation, ok, err);
     return 0;
 }
 
 void GusekAiPane::HandleDownloadDone(bool success) {
-    m_downloading = 0;
+    InterlockedExchange(&m_downloading, 0);
+    m_busy = false;
     EnableWindow(m_btnSend, TRUE);
     EnableWindow(m_btnStop, FALSE);
     SetStatus(success ? "Model ready. You can now ask questions." : "Download failed or stopped.");
@@ -743,37 +786,39 @@ LRESULT CALLBACK GusekAiPane::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
     }
 
     case WM_AI_DATA:
-        if (pPane) pPane->DrainPendingBuffer();
+        if (pPane && static_cast<LONG>(wParam) == pPane->m_generation)
+            pPane->DrainPendingBuffer();
         return 0;
 
     case WM_AI_STATUS:
-        if (pPane) {
-            char *s = (char *)lParam;
-            if (s) {
-                pPane->SetStatus(s);
-                free(s);
-            }
-        }
-        return 0;
-
     case WM_AI_DONE:
-        if (pPane) pPane->FinishTurn(wParam != 0);
-        return 0;
-
     case WM_AI_DLDONE:
-        if (pPane) {
-            char *err = (char *)lParam;
-            if (err) {
-                pPane->SetStatus(err);
-                free(err);
+    case WM_AI_OFFER_DOWNLOAD: {
+        AiWorkerEvent *event = reinterpret_cast<AiWorkerEvent *>(lParam);
+        if (event && pPane &&
+            (event->generation == pPane->m_generation ||
+             (event->generation == 0 && pPane->m_downloading))) {
+            if (msg == WM_AI_STATUS) {
+                pPane->SetStatus(event->text);
+            } else if (msg == WM_AI_DONE) {
+                pPane->JoinWorkers();
+                pPane->FinishTurn(event->success);
+                if (!event->text.empty()) pPane->SetStatus(event->text);
+            } else if (msg == WM_AI_DLDONE) {
+                pPane->JoinWorkers();
+                pPane->HandleDownloadDone(event->success);
+                if (!event->text.empty()) pPane->SetStatus(event->text);
+            } else {
+                pPane->JoinWorkers();
+                pPane->FinishTurn(false);
+                pPane->TriggerFirstRunDownload(false);
             }
-            pPane->HandleDownloadDone(wParam != 0);
         }
+        delete event;
         return 0;
+    }
 
-    case WM_AI_OFFER_DOWNLOAD:
-        if (pPane) pPane->TriggerFirstRunDownload(false);
-        return 0;
+
 
     case WM_DESTROY:
         return 0;

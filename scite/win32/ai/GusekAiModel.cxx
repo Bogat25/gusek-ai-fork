@@ -1,4 +1,5 @@
 #include "GusekAiModel.h"
+#include "GusekAiHttp.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <fstream>
@@ -41,45 +42,11 @@ void GusekAiModel::Stop() {
     m_isOwnedProcess = false;
 }
 
-bool GusekAiModel::CheckHealth(const std::string &host, int port) {
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
-
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
-        WSACleanup();
-        return false;
-    }
-
-    // Set non-blocking or timeout
-    DWORD timeout = 1000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
-
-    sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)port);
-    addr.sin_addr.s_addr = inet_addr(host.c_str());
-
-    bool ready = false;
-    if (connect(s, (sockaddr *)&addr, sizeof(addr)) == 0) {
-        std::string req = "GET /health HTTP/1.1\r\nHost: " + host + ":" + std::to_string(port) + "\r\nConnection: close\r\n\r\n";
-        send(s, req.c_str(), (int)req.length(), 0);
-
-        char buf[512] = {0};
-        int received = recv(s, buf, sizeof(buf) - 1, 0);
-        if (received > 0) {
-            buf[received] = '\0';
-            if (strstr(buf, "200 OK") || strstr(buf, "HTTP/1.1 200") || strstr(buf, "HTTP/1.0 200")) {
-                ready = true;
-            }
-        }
-    }
-
-    closesocket(s);
-    WSACleanup();
-    return ready;
+bool GusekAiModel::CheckHealth(const std::string &host, int port, HANDLE cancelEvent) {
+    GusekAiHttpRequest http(cancelEvent, NULL, 1000);
+    DWORD status = 0;
+    return http.Open(Utf8ToWide(host), static_cast<INTERNET_PORT>(port), L"GET", L"/health") &&
+        http.Send() && http.Receive() && http.Status(status) && status == 200;
 }
 
 static std::string ExtractLastLogError(const std::string &logPath) {
@@ -100,13 +67,24 @@ static std::string ExtractLastLogError(const std::string &logPath) {
     return lastErr;
 }
 
-bool GusekAiModel::EnsureRunning(const GusekAiConfig &config, std::string &outError) {
+bool GusekAiModel::EnsureRunning(const GusekAiConfig &config, std::string &outError, HANDLE cancelEvent) {
     outError.clear();
 
+    if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+        outError = "Stopped";
+        return false;
+    }
     // 1. If server is already answering /health, use it
-    if (CheckHealth(config.host, config.port)) {
+    if (CheckHealth(config.host, config.port, cancelEvent)) {
         return true;
     }
+
+    if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+        outError = "Stopped";
+        return false;
+    }
+    // Release handles from an earlier crashed process before starting another.
+    Stop();
 
     // 2. Check if files exist
     DWORD srvAttr = GetFileAttributesA(config.resolved_server_exe.c_str());
@@ -128,8 +106,17 @@ bool GusekAiModel::EnsureRunning(const GusekAiConfig &config, std::string &outEr
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
             memset(&li, 0, sizeof(li));
             li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(m_hJob, JobObjectExtendedLimitInformation, &li, sizeof(li));
+            if (!SetInformationJobObject(m_hJob, JobObjectExtendedLimitInformation, &li, sizeof(li))) {
+                Stop();
+                outError = "Could not configure model process cleanup";
+                return false;
+            }
         }
+    }
+
+    if (!m_hJob) {
+        outError = "Could not create the model process job";
+        return false;
     }
 
     // 4. Build command line
@@ -211,19 +198,27 @@ bool GusekAiModel::EnsureRunning(const GusekAiConfig &config, std::string &outEr
         return false;
     }
 
-    if (m_hJob) {
-        AssignProcessToJobObject(m_hJob, pi.hProcess);
-    }
-    ResumeThread(pi.hThread);
-    CloseHandle(pi.hThread);
-
     m_hProcess = pi.hProcess;
     m_dwPid = pi.dwProcessId;
     m_isOwnedProcess = true;
+    if (!AssignProcessToJobObject(m_hJob, pi.hProcess) ||
+        ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
+        CloseHandle(pi.hThread);
+        Stop();
+        outError = "Could not start the model in its cleanup job";
+        return false;
+    }
+    CloseHandle(pi.hThread);
 
     // 6. Poll /health until ready or timeout
-    int maxPolls = config.startup_timeout * 2;
-    for (int i = 0; i < maxPolls; i++) {
+    DWORD startupMs = static_cast<DWORD>((std::max)(1, (std::min)(config.startup_timeout, 86400))) * 1000;
+    DWORD start = GetTickCount();
+    while (GetTickCount() - start < startupMs) {
+        if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+            Stop();
+            outError = "Stopped";
+            return false;
+        }
         if (!IsOwnedProcessRunning()) {
             std::string lastErr = ExtractLastLogError(config.resolved_log_file);
             if (!lastErr.empty()) {
@@ -235,12 +230,14 @@ bool GusekAiModel::EnsureRunning(const GusekAiConfig &config, std::string &outEr
             return false;
         }
 
-        if (CheckHealth(config.host, config.port)) {
+        if (CheckHealth(config.host, config.port, cancelEvent)) {
             return true;
         }
-        Sleep(500);
+        if (cancelEvent) WaitForSingleObject(cancelEvent, 500);
+        else Sleep(500);
     }
 
+    Stop();
     outError = "Model server startup timed out after " + std::to_string(config.startup_timeout) + "s";
     return false;
 }

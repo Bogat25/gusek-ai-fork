@@ -1,4 +1,5 @@
 #include "GusekAiDownload.h"
+#include "GusekAiHttp.h"
 #include <winhttp.h>
 #include <bcrypt.h>
 #include <io.h>
@@ -10,7 +11,7 @@
 #define WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY 4
 #endif
 
-bool GusekAiDownload::VerifyFileSha256(const std::string &filePath, const std::string &expectedSha256) {
+bool GusekAiDownload::VerifyFileSha256(const std::string &filePath, const std::string &expectedSha256, volatile LONG *cancelFlag) {
     HANDLE hFile = CreateFileA(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return false;
 
@@ -23,7 +24,8 @@ bool GusekAiDownload::VerifyFileSha256(const std::string &filePath, const std::s
             BYTE buffer[65536];
             DWORD bytesRead = 0;
             while (ReadFile(hFile, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0) {
-                BCryptHashData(hHash, buffer, bytesRead, 0);
+                if (cancelFlag && InterlockedCompareExchange(cancelFlag, 0, 0)) break;
+                if (BCryptHashData(hHash, buffer, bytesRead, 0) != 0) break;
             }
             BYTE hash[32];
             if (BCryptFinishHash(hHash, hash, sizeof(hash), 0) == 0) {
@@ -32,7 +34,8 @@ bool GusekAiDownload::VerifyFileSha256(const std::string &filePath, const std::s
                     sprintf(hex + i * 2, "%02x", hash[i]);
                 }
                 hex[64] = '\0';
-                ok = (_stricmp(hex, expectedSha256.c_str()) == 0);
+                ok = (!cancelFlag || !InterlockedCompareExchange(cancelFlag, 0, 0)) &&
+                    (_stricmp(hex, expectedSha256.c_str()) == 0);
             }
             BCryptDestroyHash(hHash);
         }
@@ -51,12 +54,17 @@ bool GusekAiDownload::DownloadWithResume(
     volatile LONG *pCancelFlag,
     DownloadProgressCallback callback,
     void *userData,
-    std::string &outError)
+    std::string &outError,
+    HANDLE cancelEvent)
 {
     outError.clear();
+    if (pCancelFlag && InterlockedCompareExchange(pCancelFlag, 0, 0)) {
+        outError = "Download paused by user";
+        return false;
+    }
 
     // Check if final destination already matches
-    if (VerifyFileSha256(destPath, expectedSha256)) {
+    if (VerifyFileSha256(destPath, expectedSha256, pCancelFlag)) {
         if (callback) callback(expectedSize, expectedSize, "Model verified in cache", userData);
         return true;
     }
@@ -72,7 +80,7 @@ bool GusekAiDownload::DownloadWithResume(
         }
         CloseHandle(hPart);
 
-        if (existingSize == expectedSize && VerifyFileSha256(partPath, expectedSha256)) {
+        if (existingSize == expectedSize && VerifyFileSha256(partPath, expectedSha256, pCancelFlag)) {
             MoveFileExA(partPath.c_str(), destPath.c_str(), MOVEFILE_REPLACE_EXISTING);
             if (callback) callback(expectedSize, expectedSize, "Download complete", userData);
             return true;
@@ -117,55 +125,22 @@ bool GusekAiDownload::DownloadWithResume(
     }
 
     DWORD accessType = (host == L"127.0.0.1" || host == L"localhost") ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_DEFAULT_PROXY;
-    HINTERNET hSession = WinHttpOpen(
-        L"GUSEK-AI-Assistant/1.0",
-        accessType,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS,
-        0);
-    if (!hSession) {
-        outError = "Failed to initialize WinHTTP session";
+    GusekAiHttpRequest http(cancelEvent, pCancelFlag, 30000);
+    DWORD reqFlags = urlComp.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
+    std::wstring headers;
+    bool usingRange = existingSize > 0;
+    if (usingRange) headers = L"Range: bytes=" + std::to_wstring(existingSize) + L"-\r\n";
+    if (!http.Open(host, urlComp.nPort, L"GET", path, reqFlags, accessType) ||
+        !http.Send(headers) || !http.Receive()) {
+        outError = http.IsCancelled() ? "Download paused by user" :
+            "Network error during download request (WinHTTP error " + std::to_string(http.Error()) + ")";
         return false;
     }
-    WinHttpSetTimeouts(hSession, 5000, 5000, 10000, 10000);
-
-    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), urlComp.nPort, 0);
-    if (!hConnect) {
-        WinHttpCloseHandle(hSession);
-        outError = "Failed to connect to host: " + WideToUtf8(host);
-        return false;
-    }
-
-    DWORD reqFlags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, reqFlags);
-    if (!hRequest) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        outError = "Failed to open WinHTTP request";
-        return false;
-    }
-
-    // Set Range header if resuming
-    bool usingRange = false;
-    if (existingSize > 0) {
-        std::wstring rangeHdr = L"Range: bytes=" + std::to_wstring(existingSize) + L"-";
-        WinHttpAddRequestHeaders(hRequest, rangeHdr.c_str(), (DWORD)rangeHdr.length(), WINHTTP_ADDREQ_FLAG_ADD);
-        usingRange = true;
-    }
-
-    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(hRequest, NULL)) {
-        DWORD err = GetLastError();
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        outError = "Network error during download request (WinHTTP error " + std::to_string(err) + ")";
-        return false;
-    }
-
     DWORD statusCode = 0;
-    DWORD statusSize = sizeof(statusCode);
-    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    if (!http.Status(statusCode)) {
+        outError = "Could not read download response status";
+        return false;
+    }
 
     DWORD fileDisposition = OPEN_ALWAYS;
     if (usingRange && statusCode == 206) {
@@ -176,18 +151,12 @@ bool GusekAiDownload::DownloadWithResume(
         existingSize = 0;
         fileDisposition = CREATE_ALWAYS;
     } else {
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
         outError = "Server returned HTTP status " + std::to_string(statusCode);
         return false;
     }
 
     HANDLE hOut = CreateFileA(partPath.c_str(), GENERIC_WRITE, 0, NULL, fileDisposition, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hOut == INVALID_HANDLE_VALUE) {
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
         outError = "Could not open target part file for writing: " + partPath;
         return false;
     }
@@ -203,7 +172,13 @@ bool GusekAiDownload::DownloadWithResume(
     DWORD bytesRead = 0;
     bool success = true;
 
-    while (WinHttpReadData(hRequest, buffer, sizeof(buffer), &bytesRead)) {
+    while (true) {
+        if (!http.Read(buffer, sizeof(buffer), bytesRead)) {
+            outError = http.IsCancelled() ? "Download paused by user" :
+                "Network error during download (WinHTTP error " + std::to_string(http.Error()) + ")";
+            success = false;
+            break;
+        }
         if (bytesRead == 0) break; // Finished stream
 
         if (pCancelFlag && *pCancelFlag) {
@@ -231,15 +206,24 @@ bool GusekAiDownload::DownloadWithResume(
     }
 
     CloseHandle(hOut);
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
 
     if (!success) return false;
+    if (http.IsCancelled()) {
+        outError = "Download paused by user";
+        return false;
+    }
+    if (expectedSize && currentDownloaded != expectedSize) {
+        outError = "Download interrupted; partial file kept for resume";
+        return false;
+    }
 
     // Verify SHA-256 of completed part file
     if (callback) callback(currentDownloaded, expectedSize, "Verifying SHA-256...", userData);
-    if (!VerifyFileSha256(partPath, expectedSha256)) {
+    if (!VerifyFileSha256(partPath, expectedSha256, pCancelFlag)) {
+        if (http.IsCancelled()) {
+            outError = "Download paused by user";
+            return false;
+        }
         DeleteFileA(partPath.c_str());
         outError = "Downloaded file checksum verification failed (SHA-256 mismatch). File removed.";
         return false;

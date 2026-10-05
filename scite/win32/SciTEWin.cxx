@@ -308,7 +308,9 @@ FilePath SciTEWin::GetSciteDefaultHome() {
 }
 
 FilePath SciTEWin::GetSciteUserHome() {
-	char *home = getenv("SciTE_HOME");
+    char *home = getenv("SciTE_USERHOME");
+    if (!home)
+        home = getenv("SciTE_HOME");
 	if (!home)
 		home = getenv("USERPROFILE");
 	return GetSciTEPath(home);
@@ -612,6 +614,7 @@ DWORD SciTEWin::ExecuteOne(const Job &jobToRun, bool &seenOutput) {
 
 	bool isSolverJob = (jobToRun.command.search("glpsol") != -1 || jobToRun.command.search(".mod") != -1);
 	if (isSolverJob) {
+		Lock lock(jobQueue.mutex);
 		lastSolverCommand = jobToRun.command.c_str();
 		lastSolverOutput.clear();
 		lastSolverError.clear();
@@ -777,6 +780,7 @@ DWORD SciTEWin::ExecuteOne(const Job &jobToRun, bool &seenOutput) {
 				if (bTest && bytesRead) {
 
 					if (isSolverJob) {
+						Lock lock(jobQueue.mutex);
 						lastSolverOutput.append(buffer, bytesRead);
 					}
 
@@ -845,6 +849,7 @@ DWORD SciTEWin::ExecuteOne(const Job &jobToRun, bool &seenOutput) {
 		OutputAppendStringSynchronised(sExitMessage.c_str());
 
 		if (isSolverJob) {
+			Lock lock(jobQueue.mutex);
 			lastSolverExitCode = exitcode;
 			std::string diag;
 			size_t pos = 0;
@@ -2181,27 +2186,41 @@ bool SciTEWin::InsertTextAtCaret(const char *utf8Text) {
 	} else {
 		DWORD charSet = props.GetInt("character.set", DEFAULT_CHARSET);
 		codePage = CodePageFromCharSet(charSet, codePage);
-		int wlen = ::MultiByteToWideChar(CP_UTF8, 0, utf8Text, -1, NULL, 0);
-		if (wlen > 0) {
-			wchar_t *wbuf = new wchar_t[wlen];
-			::MultiByteToWideChar(CP_UTF8, 0, utf8Text, -1, wbuf, wlen);
-			int mblen = ::WideCharToMultiByte(codePage, 0, wbuf, -1, NULL, 0, NULL, NULL);
-			if (mblen > 0) {
-				char *mbbuf = new char[mblen];
-				::WideCharToMultiByte(codePage, 0, wbuf, -1, mbbuf, mblen, NULL, NULL);
-				SendEditor(SCI_BEGINUNDOACTION);
-				SendEditor(SCI_REPLACESEL, 0, reinterpret_cast<sptr_t>(mbbuf));
-				SendEditor(SCI_ENDUNDOACTION);
-				delete []mbbuf;
-			}
-			delete []wbuf;
-		}
+		int wlen = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Text, -1, NULL, 0);
+		if (wlen <= 0) return false;
+		std::vector<wchar_t> wide(wlen);
+		if (!::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Text, -1, &wide[0], wlen))
+			return false;
+		BOOL substituted = FALSE;
+        int length = ::WideCharToMultiByte(codePage, 0,
+			&wide[0], -1, NULL, 0, NULL, &substituted);
+		if (length <= 0 || substituted) return false;
+		std::vector<char> encoded(length);
+		substituted = FALSE;
+        if (!::WideCharToMultiByte(codePage, 0,
+			&wide[0], -1, &encoded[0], length, NULL, &substituted) || substituted)
+			return false;
+        int roundTripLength = ::MultiByteToWideChar(codePage, 0, &encoded[0], -1, NULL, 0);
+        if (roundTripLength != wlen) return false;
+        std::vector<wchar_t> roundTrip(wlen);
+        if (!::MultiByteToWideChar(codePage, 0, &encoded[0], -1, &roundTrip[0], wlen) ||
+            roundTrip != wide) return false;
+        // Only change the existing buffer after proving conversion is lossless.
+		SendEditor(SCI_BEGINUNDOACTION);
+		SendEditor(SCI_REPLACESEL, 0, reinterpret_cast<sptr_t>(&encoded[0]));
+		SendEditor(SCI_ENDUNDOACTION);
 	}
 	WindowSetFocus(wEditor);
 	return true;
 }
 
 bool SciTEWin::CreateNewMathProgDocument(const char *utf8Text) {
+    // A full tab set would make legacy New() close an existing document.
+    // Preserve that document rather than replacing it during an encoding fallback.
+    if (buffers.length >= buffers.size &&
+        (!CurrentBuffer()->IsUntitled() || SendEditor(SCI_GETMODIFY) ||
+         SendEditor(SCI_GETLENGTH) || buffers.Current() != 0))
+        return false;
 	New();
 	FilePath curDir(filePath.Directory());
 	filePath.Set(curDir, "Untitled.mod");
@@ -2221,10 +2240,12 @@ bool SciTEWin::CreateNewMathProgDocument(const char *utf8Text) {
 }
 
 std::string SciTEWin::GetLastSolverError() {
+	Lock lock(jobQueue.mutex);
 	return lastSolverError;
 }
 
 std::string SciTEWin::GetLastSolverOutput() {
+	Lock lock(jobQueue.mutex);
 	return lastSolverOutput;
 }
 

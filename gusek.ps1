@@ -138,16 +138,8 @@ function Initialize-VcVars {
     if (-not $bat) {
         Stop-WithError "Visual Studio vcvarsall.bat not found. Install VS with C++ support or pass -VcVars."
     }
-    # Load environment variables into current process
-    $lines = cmd /c "`"$bat`" x86 >nul 2>&1 && set"
-    foreach ($line in $lines) {
-        if ($line -match '^(.*?)=(.*)$') {
-            [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
-        }
-    }
-    if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
-        Stop-WithError "MSVC cl.exe not available after running vcvarsall.bat x86"
-    }
+    # Each build runs inside the developer shell. Never dump inherited variables.
+    $script:VcVarsPath = $bat
 }
 
 function Find-InnoSetup {
@@ -231,7 +223,7 @@ function Ensure-CacheFile([string]$TargetName, [string]$Url, [string]$ExpectedSh
 # ---------------------------------------------------------------------
 function Sync-Tree {
     New-Item -ItemType Directory -Force -Path $Tree | Out-Null
-    $out = & robocopy.exe $Repo $Tree /E /XO /XX /XD .git .vs .vscode /NDL /NJH /NJS /NP /NC /NS /R:1 /W:1 /MT:16
+    $out = & robocopy.exe $Repo $Tree /E /XD .git .vs .vscode /XF *.obj *.pdb *.ilk *.idb *.exp *.lib *.exe *.dll *.res *.log /NDL /NJH /NJS /NP /NC /NS /R:1 /W:1 /MT:16
     $rc = $LASTEXITCODE
     if ($rc -ge 8) { Stop-WithError "copying sources to $Tree failed (robocopy code $rc)" }
     Note "source mirror synchronized to $Tree"
@@ -246,7 +238,7 @@ function Do-Doctor {
     if ($vcvars) {
         Note "MSVC vcvarsall: $vcvars"
         Initialize-VcVars
-        $clVer = (cmd /c "cl 2>&1" | Select-Object -First 1)
+        $clVer = (cmd /d /c "call `"$script:VcVarsPath`" x86 >nul 2>&1 && cl 2>&1" | Select-Object -First 1)
         Note "Compiler: $clVer"
     } else {
         Warn "MSVC vcvarsall.bat NOT found"
@@ -324,7 +316,7 @@ function Do-FullBuild {
     $scintillaDir = Join-Path $Tree 'scintilla\win32'
     Push-Location $scintillaDir
     try {
-        cmd /c "nmake -f scintilla.mak > `"$log`" 2>&1"
+        cmd /d /c "call `"$script:VcVarsPath`" x86 >nul 2>&1 && nmake -f scintilla.mak > `"$log`" 2>&1"
         if ($LASTEXITCODE -ne 0) { Stop-WithError "Scintilla build failed" }
     } finally { Pop-Location }
 
@@ -332,7 +324,7 @@ function Do-FullBuild {
     $sciteDir = Join-Path $Tree 'scite\win32'
     Push-Location $sciteDir
     try {
-        cmd /c "nmake -f scite.mak ..\bin\Sc1.exe >> `"$log`" 2>&1"
+        cmd /d /c "call `"$script:VcVarsPath`" x86 >nul 2>&1 && nmake -f scite.mak ..\bin\Sc1.exe >> `"$log`" 2>&1"
         if ($LASTEXITCODE -ne 0) { Stop-WithError "GUSEK (Sc1.exe) build failed" }
     } finally { Pop-Location }
 
@@ -346,7 +338,7 @@ function Do-FullBuild {
     # Copy runtime dependencies and assets from repo
     foreach ($item in @('glpsol.exe', 'glpk_4_65.dll', 'SciTEGlobal.properties', 'gmpl.properties',
                         'gnuplot.properties', 'python.properties', 'gusek.lua', 'gmpl.api', 'gmpl.abb',
-                        'README', 'gusek.html', 'examples', 'gusek_tips', 'Start-Gusek.cmd')) {
+                        'README', 'gusek.html', 'gmpl.pdf', 'glpk.pdf', 'examples', 'gusek_tips', 'Start-Gusek.cmd')) {
         $src = Join-Path $Repo $item
         if (Test-Path $src) {
             Copy-Item $src $Stage -Recurse -Force
@@ -356,6 +348,9 @@ function Do-FullBuild {
     # Stage llama-server
     $llamaZipPath = Join-Path $Cache $LlamaZip
     if (Test-Path $llamaZipPath) {
+        if (-not (Verify-Sha256 $llamaZipPath $LlamaSha256)) {
+            Stop-WithError "Cached llama.cpp archive does not match its SHA-256 pin."
+        }
         $llamaDest = Join-Path $Stage 'ai\llama'
         New-Item -ItemType Directory -Force -Path $llamaDest | Out-Null
         Expand-Archive -Path $llamaZipPath -DestinationPath $llamaDest -Force
@@ -387,7 +382,7 @@ function Do-QuickBuild {
     $sciteDir = Join-Path $Tree 'scite\win32'
     Push-Location $sciteDir
     try {
-        cmd /c "nmake -f scite.mak ..\bin\Sc1.exe > `"$log`" 2>&1"
+        cmd /d /c "call `"$script:VcVarsPath`" x86 >nul 2>&1 && nmake -f scite.mak ..\bin\Sc1.exe > `"$log`" 2>&1"
         if ($LASTEXITCODE -ne 0) { Stop-WithError "GUSEK build failed" }
     } finally { Pop-Location }
 
@@ -415,7 +410,23 @@ function Do-Clean {
     Note "Clean completed."
 }
 
+function Get-NumericVersion([string]$Value) {
+    if ($Value -notmatch '^v?(\d+(?:\.\d+){1,3})(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$') {
+        Stop-WithError "Invalid version '$Value'. Use a numeric version such as 0.1.0 or 0.1.0-rc1."
+    }
+    $parts = @($Matches[1].Split('.') | ForEach-Object {
+        $partValue = [uint32]0
+        if (-not [uint32]::TryParse($_, [ref]$partValue) -or $partValue -gt 65535) {
+            Stop-WithError "Windows version components must be between 0 and 65535."
+        }
+        [string]$partValue
+    })
+    while ($parts.Count -lt 4) { $parts += '0' }
+    return ($parts -join '.')
+}
+
 function Do-Installer {
+    $numericVersion = Get-NumericVersion $Version
     Do-FullBuild
     $iscc = Find-InnoSetup
     if (-not $iscc) {
@@ -430,6 +441,7 @@ function Do-Installer {
     Say "Compiling Inno Setup installer using $iscc..."
     $proc = Start-Process -FilePath $iscc -ArgumentList @(
         "/DAppVersion=$Version",
+        "/DNumericVersion=$numericVersion",
         "/DStageDir=`"$Stage`"",
         "/DOutputDir=`"$Dist`"",
         "`"$iss`""
@@ -467,13 +479,16 @@ switch ($Command) {
     'dev'       { Do-QuickBuild; Do-Run }
     'test'      {
         if (Test-Path (Join-Path $Repo 'tests\ai\run-tests.ps1')) {
-            & (Join-Path $Repo 'tests\ai\run-tests.ps1') -Real:$Real -Gui:$Gui -Installer:$Installer
+            $global:LASTEXITCODE = 0
+            & (Join-Path $Repo 'tests\ai\run-tests.ps1') -BuildRoot $BuildRoot -Real:$Real -Gui:$Gui -Installer:$Installer
+            exit $LASTEXITCODE
         } else {
             Note "Running unit checks..."
             Do-Doctor
         }
     }
     'package'   {
+        $null = Get-NumericVersion $Version
         Do-FullBuild
         Say "Assembling portable distribution in $Dist..."
         New-Item -ItemType Directory -Force -Path $Dist | Out-Null

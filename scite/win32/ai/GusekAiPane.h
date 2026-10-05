@@ -35,10 +35,13 @@ class GusekAiPane {
     volatile LONG   m_downloading;
     bool            m_mouseDragging;
     LONG            m_currentTurnStartPos;
+    LONG            m_generation;
+    HANDLE          m_cancelEvent;
 
     std::string     m_lastAnswer;
     std::string     m_currentStreamingReply;
     std::vector<ChatMessage> m_history;
+    ChatMessage     m_pendingQuestion;
     std::vector<ChatImageAttachment> m_attachedImages;
 
     // Thread synchronization
@@ -46,7 +49,7 @@ class GusekAiPane {
     std::string     m_pendingBuffer;
     volatile LONG   m_postPending;
     HANDLE          m_hWorkerThread;
-    SOCKET          m_workerSocket;
+    HANDLE          m_hDownloadThread;
 
     static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK InputSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
@@ -59,6 +62,10 @@ class GusekAiPane {
     void SetStatus(const std::string &status);
     void AppendTextToInput(const std::string &text);
     void ShowAttachMenu();
+    void JoinWorkers();
+    void DiscardWorkerMessages();
+    void PostWorkerMessage(UINT message, LONG generation, bool success,
+                           const std::string &text = "");
 
 public:
     GusekAiPane(IGusekAiHost *pHost);

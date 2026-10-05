@@ -58,7 +58,7 @@ jobs:
           key: gusek-downloads-${{ hashFiles('gusek.ps1') }}
           restore-keys: gusek-downloads-
 
-      - name: Fetch pinned llama.cpp and Inno Setup
+      - name: Fetch pinned llama.cpp
         run: .\gusek.cmd fetch -NoModel -BuildRoot $env:BUILD_ROOT
 
       - name: Build GUSEK and Scintilla

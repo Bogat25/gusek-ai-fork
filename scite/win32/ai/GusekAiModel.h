@@ -16,10 +16,10 @@ public:
 
     // Starts llama-server if not already answering /health.
     // Returns true when server is ready, false on error.
-    bool EnsureRunning(const GusekAiConfig &config, std::string &outError);
+    bool EnsureRunning(const GusekAiConfig &config, std::string &outError, HANDLE cancelEvent = NULL);
 
     // Checks if loopback server responds 200 to /health
-    static bool CheckHealth(const std::string &host, int port);
+    static bool CheckHealth(const std::string &host, int port, HANDLE cancelEvent = NULL);
 
     // Stops owned server process
     void Stop();
