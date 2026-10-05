@@ -11,8 +11,10 @@
 #define WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY 4
 #endif
 
-bool GusekAiDownload::VerifyFileSha256(const std::string &filePath, const std::string &expectedSha256, volatile LONG *cancelFlag) {
-    HANDLE hFile = CreateFileA(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+bool GusekAiDownload::VerifyFileSha256(const std::string &filePath, const std::string &expectedSha256, volatile LONG *cancelFlag, HANDLE cancelEvent) {
+    if (expectedSha256.size() != 64 ||
+        expectedSha256.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return false;
+    HANDLE hFile = CreateFileW(Utf8ToWide(filePath).c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return false;
 
     BCRYPT_ALG_HANDLE hAlg = NULL;
@@ -23,9 +25,13 @@ bool GusekAiDownload::VerifyFileSha256(const std::string &filePath, const std::s
         if (BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0) == 0) {
             BYTE buffer[65536];
             DWORD bytesRead = 0;
-            while (ReadFile(hFile, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0) {
-                if (cancelFlag && InterlockedCompareExchange(cancelFlag, 0, 0)) break;
-                if (BCryptHashData(hHash, buffer, bytesRead, 0) != 0) break;
+            bool readOk = true;
+            while (true) {
+                if (!ReadFile(hFile, buffer, sizeof(buffer), &bytesRead, NULL)) { readOk = false; break; }
+                if (!bytesRead) break;
+                if ((cancelFlag && InterlockedCompareExchange(cancelFlag, 0, 0)) ||
+                    (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0)) { readOk = false; break; }
+                if (BCryptHashData(hHash, buffer, bytesRead, 0) != 0) { readOk = false; break; }
             }
             BYTE hash[32];
             if (BCryptFinishHash(hHash, hash, sizeof(hash), 0) == 0) {
@@ -34,7 +40,7 @@ bool GusekAiDownload::VerifyFileSha256(const std::string &filePath, const std::s
                     sprintf(hex + i * 2, "%02x", hash[i]);
                 }
                 hex[64] = '\0';
-                ok = (!cancelFlag || !InterlockedCompareExchange(cancelFlag, 0, 0)) &&
+                ok = readOk && (!cancelEvent || WaitForSingleObject(cancelEvent, 0) != WAIT_OBJECT_0) && (!cancelFlag || !InterlockedCompareExchange(cancelFlag, 0, 0)) &&
                     (_stricmp(hex, expectedSha256.c_str()) == 0);
             }
             BCryptDestroyHash(hHash);
@@ -72,7 +78,7 @@ bool GusekAiDownload::DownloadWithResume(
     std::string partPath = destPath + ".part";
     unsigned __int64 existingSize = 0;
 
-    HANDLE hPart = CreateFileA(partPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hPart = CreateFileW(Utf8ToWide(partPath).c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hPart != INVALID_HANDLE_VALUE) {
         LARGE_INTEGER li;
         if (GetFileSizeEx(hPart, &li)) {
@@ -81,13 +87,16 @@ bool GusekAiDownload::DownloadWithResume(
         CloseHandle(hPart);
 
         if (existingSize == expectedSize && VerifyFileSha256(partPath, expectedSha256, pCancelFlag)) {
-            MoveFileExA(partPath.c_str(), destPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+            if (!MoveFileExW(Utf8ToWide(partPath).c_str(), Utf8ToWide(destPath).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                outError = "Failed to rename verified model into place.";
+                return false;
+            }
             if (callback) callback(expectedSize, expectedSize, "Download complete", userData);
             return true;
         }
-        if (existingSize > expectedSize) {
+        if (expectedSize && existingSize >= expectedSize) {
             // Corrupt or outdated part file
-            DeleteFileA(partPath.c_str());
+            DeleteFileW(Utf8ToWide(partPath).c_str());
             existingSize = 0;
         }
     }
@@ -105,6 +114,17 @@ bool GusekAiDownload::DownloadWithResume(
         }
     }
 
+    size_t parentEnd = destPath.find_last_of("/\\");
+    std::wstring parent = Utf8ToWide(parentEnd == std::string::npos ? "." : destPath.substr(0, parentEnd));
+    ULARGE_INTEGER available;
+    if (!GetDiskFreeSpaceExW(parent.c_str(), &available, NULL, NULL)) {
+        outError = "The model folder is not writable or does not exist";
+        return false;
+    }
+    if (expectedSize > existingSize && available.QuadPart < expectedSize - existingSize) {
+        outError = "Not enough free disk space for the model download";
+        return false;
+    }
     std::wstring wUrl = Utf8ToWide(url);
     URL_COMPONENTSW urlComp;
     memset(&urlComp, 0, sizeof(urlComp));
@@ -124,7 +144,7 @@ bool GusekAiDownload::DownloadWithResume(
         path.append(urlComp.lpszExtraInfo, urlComp.dwExtraInfoLength);
     }
 
-    DWORD accessType = (host == L"127.0.0.1" || host == L"localhost") ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_DEFAULT_PROXY;
+    DWORD accessType = (host == L"127.0.0.1" || host == L"localhost") ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY;
     GusekAiHttpRequest http(cancelEvent, pCancelFlag, 30000);
     DWORD reqFlags = urlComp.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
     std::wstring headers;
@@ -144,7 +164,14 @@ bool GusekAiDownload::DownloadWithResume(
 
     DWORD fileDisposition = OPEN_ALWAYS;
     if (usingRange && statusCode == 206) {
-        // Range accepted, append
+        std::wstring range;
+        unsigned __int64 first = 0, last = 0, total = 0;
+        if (!http.Header(WINHTTP_QUERY_CONTENT_RANGE, range) ||
+            swscanf(range.c_str(), L"bytes %llu-%llu/%llu", &first, &last, &total) != 3 ||
+            first != existingSize || last < first || last >= total || (expectedSize && total != expectedSize)) {
+            outError = "Invalid download range response; partial file kept for resume";
+            return false;
+        }
         fileDisposition = OPEN_ALWAYS;
     } else if (statusCode == 200) {
         // Range ignored or fresh download, truncate
@@ -155,7 +182,7 @@ bool GusekAiDownload::DownloadWithResume(
         return false;
     }
 
-    HANDLE hOut = CreateFileA(partPath.c_str(), GENERIC_WRITE, 0, NULL, fileDisposition, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hOut = CreateFileW(Utf8ToWide(partPath).c_str(), GENERIC_WRITE, 0, NULL, fileDisposition, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hOut == INVALID_HANDLE_VALUE) {
         outError = "Could not open target part file for writing: " + partPath;
         return false;
@@ -187,6 +214,11 @@ bool GusekAiDownload::DownloadWithResume(
             break;
         }
 
+        if (expectedSize && bytesRead > expectedSize - currentDownloaded) {
+            outError = "Download exceeded the expected model size";
+            success = false;
+            break;
+        }
         DWORD bytesWritten = 0;
         if (!WriteFile(hOut, buffer, bytesRead, &bytesWritten, NULL) || bytesWritten != bytesRead) {
             outError = "Disk write failure during download";
@@ -224,13 +256,13 @@ bool GusekAiDownload::DownloadWithResume(
             outError = "Download paused by user";
             return false;
         }
-        DeleteFileA(partPath.c_str());
+        DeleteFileW(Utf8ToWide(partPath).c_str());
         outError = "Downloaded file checksum verification failed (SHA-256 mismatch). File removed.";
         return false;
     }
 
     // Atomic move to final destination
-    if (!MoveFileExA(partPath.c_str(), destPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    if (!MoveFileExW(Utf8ToWide(partPath).c_str(), Utf8ToWide(destPath).c_str(), MOVEFILE_REPLACE_EXISTING)) {
         outError = "Failed to rename verified model into place.";
         return false;
     }

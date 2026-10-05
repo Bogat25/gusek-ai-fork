@@ -10,6 +10,36 @@ function Run-Setup([string]$Executable,[string[]]$Arguments) {
     if ($process.ExitCode -ne 0) { throw "Installer process failed: $($process.ExitCode)" }
 }
 
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class InstallerManifest {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern IntPtr LoadLibraryEx(string file, IntPtr unused, uint flags);
+    [DllImport("kernel32.dll")] static extern bool FreeLibrary(IntPtr module);
+    [DllImport("kernel32.dll")] static extern IntPtr FindResource(IntPtr module, IntPtr name, IntPtr type);
+    [DllImport("kernel32.dll")] static extern IntPtr LoadResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32.dll")] static extern IntPtr LockResource(IntPtr resource);
+    [DllImport("kernel32.dll")] static extern uint SizeofResource(IntPtr module, IntPtr resource);
+    public static string Read(string file) {
+        IntPtr module = LoadLibraryEx(file, IntPtr.Zero, 2);
+        if (module == IntPtr.Zero) throw new Exception("Cannot inspect executable manifest.");
+        try {
+            IntPtr resource = FindResource(module, new IntPtr(1), new IntPtr(24));
+            if (resource == IntPtr.Zero) throw new Exception("Executable has no explicit manifest.");
+            byte[] bytes = new byte[SizeofResource(module, resource)];
+            Marshal.Copy(LockResource(LoadResource(module, resource)), bytes, 0, bytes.Length);
+            return Encoding.UTF8.GetString(bytes);
+        } finally { FreeLibrary(module); }
+    }
+}
+'@
+function Assert-NoElevation([string]$Executable) {
+    $manifest = [InstallerManifest]::Read($Executable)
+    Assert ($manifest -match 'requestedExecutionLevel\s+level="asInvoker"' -and
+            $manifest -notmatch 'requireAdministrator|highestAvailable') 'Executable manifest requests no elevation.'
+}
+
 $Stage = Join-Path $BuildRoot 'stage'
 $Dist = Join-Path $BuildRoot 'dist'
 $Cache = Join-Path $BuildRoot 'cache'
@@ -38,6 +68,11 @@ $version = $version.Substring(0,$version.Length - '-setup'.Length)
 Assert ($production.VersionInfo.FileVersion.Trim() -eq (Get-NumericVersion $version)) 'Installer metadata matches its version.'
 $checksum = ((Get-Content -LiteralPath ($production.FullName + '.sha256') -Raw) -split '\s+')[0]
 Assert ((Get-FileHash -LiteralPath $production.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $checksum) 'Published installer checksum matches.'
+Assert-NoElevation $production.FullName
+Assert-NoElevation (Join-Path $Stage 'gusek.exe')
+$elevated = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+Write-Host "Installer test caller elevated: $elevated"
 
 # Same packaging source, but unique identity, shortcuts and explicit data path.
 # Neither the real installation nor the user's GusekAI model folder is touched.
@@ -45,13 +80,15 @@ $identifier = [guid]::NewGuid().ToString('D')
 $appId = '{' + $identifier + '}'
 $name = 'GUSEK AI Test ' + $identifier
 $caseRoot = Join-Path $WorkRoot ('installer-' + $identifier)
-$itApp = Join-Path $caseRoot 'GUSEK AI install with spaces'
+$userPrograms = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs'
+$itApp = Join-Path $userPrograms $name
 $data = Join-Path $caseRoot 'isolated data with spaces'
 $outputDir = Join-Path $caseRoot 'output'
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) ($name + '.lnk')
 $registration = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\' + $appId + '_is1'
 Assert (-not (Test-Path $shortcut) -and -not (Test-Path $registration)) 'Test identity is separate from existing installations.'
+Assert (-not (Test-Path -LiteralPath $itApp)) 'Default per-user test destination is unused.'
 $arguments = @(
     '/DAppVersion=0.0.0-test', '/DNumericVersion=0.0.0.0',
     "/DAppIdValue={$appId", "/DAppName=$name", "/DAiDataDir=$data",
@@ -68,17 +105,32 @@ $savedData = $env:GUSEK_AI_DATA
 $env:GUSEK_AI_DATA = $data
 $uninstalled = $false
 try {
-    Run-Setup $setup @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=`"$itApp`"")
+    Assert-NoElevation $setup
+    Run-Setup $setup @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART')
+    Assert (Test-Path -LiteralPath $itApp) 'Default installation uses LocalAppData Programs without a directory override.'
+    Assert-NoElevation $uninstaller
     foreach ($relative in @('gusek.exe','glpsol.exe','glpk_4_65.dll','Start-Gusek.cmd',
                             'ai\llama\llama-server.exe','ai\defaults\GusekAI.ini',
-                            'ai\defaults\system_prompt.txt')) {
+                            'ai\defaults\system_prompt.txt','COPYING','AI-README.md','THIRD-PARTY.md',
+                            'licenses\scintilla-LICENSE.txt','licenses\scite-LICENSE.txt','licenses\llama.cpp-LICENSE.txt',
+                            'ai\llama\LICENSE-LLVM-OpenMP')) {
         Assert (Test-Path (Join-Path $itApp $relative)) "Installed component $relative exists."
     }
     Assert (@(Get-ChildItem -LiteralPath $itApp -Filter '*.gguf' -Recurse).Count -eq 0) 'Installer includes no large model files.'
     Assert (Test-Path $registration) 'Separate per-user uninstall registration exists.'
     Assert (Test-Path $shortcut) 'Separate Start menu shortcut exists.'
+    foreach ($machineKey in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\',
+                              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\')) {
+        Assert (-not (Test-Path ($machineKey + $appId + '_is1'))) 'Installation creates no machine-wide uninstall registration.'
+    }
+    $shell = New-Object -ComObject WScript.Shell
+    $link = $shell.CreateShortcut($shortcut)
+    Assert ($link.TargetPath -eq (Join-Path $itApp 'gusek.exe') -and $link.WorkingDirectory -eq $itApp) 'Per-user shortcut launches the installed app from its own folder.'
+    [Runtime.InteropServices.Marshal]::FinalReleaseComObject($link) | Out-Null
+    [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null
+    & (Join-Path $RepoRoot 'tests\ai\launcher-regressions.ps1') -Stage $itApp -WorkRoot $caseRoot -Shortcut $shortcut
     $python = (Get-Command python).Source
-    & $python (Join-Path $RepoRoot 'tests\ai\gui_regressions.py') --stage $itApp --work-root $caseRoot
+    & $python (Join-Path $RepoRoot 'tests\ai\gui_regressions.py') --stage $itApp --work-root $caseRoot --fixtures (Join-Path $WorkRoot 'native')
     if ($LASTEXITCODE -ne 0) { throw 'Installed application regression checks failed.' }
 
     $ini = Join-Path $itApp 'ai\defaults\GusekAI.ini'

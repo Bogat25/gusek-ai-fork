@@ -1038,7 +1038,6 @@ void SciTEWin::Creation() {
 		DestroyMenuItem(menuOptions,IDM_OPENLUAEXTERNALFILE);
 #endif
 
-	aiPane = new GusekAiPane(this);
-	aiPane->Create(reinterpret_cast<HWND>(wContent.GetID()), 0, 0, widthAiPane, 100);
+	ConfigureAiAssistant();
 }
 

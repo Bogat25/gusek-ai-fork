@@ -1,4 +1,5 @@
 #include "GusekAiRender.h"
+#include "GusekAiImage.h"
 #include <sstream>
 
 #define IMF_AUTOFONT 0x0002
@@ -110,9 +111,38 @@ static std::string MarkdownToRtf(const std::string &md) {
     bool inInlineCode = false;
     bool inBold = false;
     bool inItalic = false;
+    bool heading = false;
 
     size_t i = 0;
     while (i < md.length()) {
+        bool lineStart = i == 0 || md[i-1] == '\n';
+        if (lineStart && !inCodeBlock && !inInlineCode) {
+            size_t end = md.find('\n', i);
+            if (end == std::string::npos) end = md.size();
+            std::string line = md.substr(i, end - i);
+            size_t meaningful = line.find_first_not_of(" \t\r");
+            std::string trimmed = meaningful == std::string::npos ? "" : line.substr(meaningful);
+            size_t last = trimmed.find_last_not_of(" \t\r");
+            if (last != std::string::npos) trimmed.resize(last + 1);
+            if (trimmed.size() >= 3 &&
+                (trimmed.find_first_not_of("-") == std::string::npos ||
+                 trimmed.find_first_not_of("*") == std::string::npos ||
+                 trimmed.find_first_not_of("_") == std::string::npos)) {
+                i = end < md.size() ? end + 1 : end;
+                continue;
+            }
+            size_t hash = i;
+            while (hash < md.size() && md[hash] == '#') ++hash;
+            if (hash > i && hash < md.size() && md[hash] == ' ') {
+                heading = true;
+                rtf += "\\b ";
+                i = hash + 1;
+            } else if (i + 1 < md.size() && (md[i] == '-' || md[i] == '*') && md[i+1] == ' ') {
+                rtf += "\\u8226? ";
+                i += 2;
+            }
+            if (i >= md.size()) break;
+        }
         // 1. Fenced code block (```)
         if (i + 2 < md.length() && md[i] == '`' && md[i+1] == '`' && md[i+2] == '`') {
             if (!inCodeBlock) {
@@ -180,7 +210,7 @@ static std::string MarkdownToRtf(const std::string &md) {
         }
 
         // 3. Bold (**word**)
-        if (i + 1 < md.length() && md[i] == '*' && md[i+1] == '*') {
+        if (!inInlineCode && i + 1 < md.length() && md[i] == '*' && md[i+1] == '*') {
             i += 2;
             inBold = !inBold;
             rtf += inBold ? "\\b " : "\\b0 ";
@@ -188,7 +218,7 @@ static std::string MarkdownToRtf(const std::string &md) {
         }
 
         // 4. Italic (*word*) - only around letters (lesson: 2 * 3 stays arithmetic)
-        if (md[i] == '*' && !inBold) {
+        if (md[i] == '*' && !inBold && !inInlineCode) {
             bool prevIsSpace = (i == 0 || md[i-1] == ' ' || md[i-1] == '\n' || md[i-1] == '(');
             bool nextIsAlpha = (i + 1 < md.length() && isalpha((unsigned char)md[i+1]));
             bool prevIsAlpha = (i > 0 && isalpha((unsigned char)md[i-1]));
@@ -207,21 +237,10 @@ static std::string MarkdownToRtf(const std::string &md) {
             }
         }
 
-        // 5. Line break / bullet / header
         if (md[i] == '\n') {
+            if (heading) { rtf += "\\b0 "; heading = false; }
             rtf += "\\par\n";
-            i++;
-            // Check for bullets "- " or "* "
-            if (i + 1 < md.length() && (md[i] == '-' || md[i] == '*') && md[i+1] == ' ') {
-                rtf += "\\bullet  ";
-                i += 2;
-            }
-            // Check for header "# "
-            else if (i < md.length() && md[i] == '#') {
-                while (i < md.length() && md[i] == '#') i++;
-                while (i < md.length() && md[i] == ' ') i++;
-                rtf += "\\b ";
-            }
+            ++i;
             continue;
         }
 
@@ -242,10 +261,18 @@ static std::string MarkdownToRtf(const std::string &md) {
             if (i + len <= md.length()) {
                 std::string u8c = md.substr(i, len);
                 std::wstring wc = Utf8ToWide(u8c);
+                unsigned int codepoint = wc.empty() ? 0 : static_cast<unsigned short>(wc[0]);
+                if (wc.size() == 2 && codepoint >= 0xd800 && codepoint <= 0xdbff)
+                    codepoint = 0x10000 + ((codepoint - 0xd800) << 10) +
+                        (static_cast<unsigned short>(wc[1]) - 0xdc00);
+                bool emoji = (codepoint >= 0x1f000 && codepoint <= 0x1ffff) ||
+                    (codepoint >= 0x2600 && codepoint <= 0x27bf) || codepoint == 0xfe0f || codepoint == 0x200d;
+                if (emoji) rtf += "{\\f2 ";
                 for (size_t wi = 0; wi < wc.length(); wi++) {
                     short cp = (short)wc[wi];
                     rtf += "\\u" + std::to_string(cp) + "?";
                 }
+                if (emoji) rtf += "}";
                 i += len;
             } else {
                 i++;
@@ -291,6 +318,8 @@ void GusekAiRender::RenderMarkdownStream(
 
     bool wasAtBottom = IsScrolledToBottom(hRichEdit);
 
+    POINT scroll = {};
+    SendMessage(hRichEdit, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
     // Save user selection
     CHARRANGE userSel;
     SendMessage(hRichEdit, EM_EXGETSEL, 0, (LPARAM)&userSel);
@@ -309,7 +338,7 @@ void GusekAiRender::RenderMarkdownStream(
     SendMessage(hRichEdit, EM_STREAMIN, SF_RTF | SFF_SELECTION, (LPARAM)&es);
 
     // Restore selection if user had selected text
-    if (userSel.cpMin != userSel.cpMax && userSel.cpMin < turnStartPos) {
+    if (userSel.cpMin != userSel.cpMax) {
         SendMessage(hRichEdit, EM_EXSETSEL, 0, (LPARAM)&userSel);
     }
 
@@ -317,12 +346,27 @@ void GusekAiRender::RenderMarkdownStream(
     SendMessage(hRichEdit, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(hRichEdit, NULL, TRUE);
 
-    if (wasAtBottom) {
-        ScrollToBottom(hRichEdit);
-    }
+    if (wasAtBottom) ScrollToBottom(hRichEdit);
+    else SendMessage(hRichEdit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
 }
 
-void GusekAiRender::AppendImageThumbnail(HWND hRichEdit, const std::string &name, HBITMAP hThumb) {
-    if (!hRichEdit) return;
-    AppendPlainText(hRichEdit, ("[Picture attached: " + name + "]\r\n").c_str());
+void GusekAiRender::AppendImageThumbnail(HWND rich, const std::string &name, HBITMAP thumbnail) {
+    if (!rich || !thumbnail) return;
+    BITMAP bitmap;
+    if (!GetObject(thumbnail, sizeof(bitmap), &bitmap)) return;
+    std::vector<BYTE> pixels;
+    if (!GusekAiImage::ThumbnailPng(thumbnail, pixels)) return;
+    std::string rtf = "{\\rtf1{\\pict\\pngblip\\picw" + std::to_string(bitmap.bmWidth) +
+        "\\pich" + std::to_string(bitmap.bmHeight) + "\\picwgoal" + std::to_string(bitmap.bmWidth * 15) +
+        "\\pichgoal" + std::to_string(bitmap.bmHeight * 15) + " ";
+    const char *hex = "0123456789abcdef";
+    for (size_t i = 0; i < pixels.size(); ++i) {
+        rtf += hex[pixels[i] >> 4]; rtf += hex[pixels[i] & 15];
+    }
+    rtf += "}}";
+    CHARRANGE end = { -1, -1 };
+    SendMessage(rich, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&end));
+    SETTEXTEX text = { ST_SELECTION, CP_ACP };
+    SendMessage(rich, EM_SETTEXTEX, reinterpret_cast<WPARAM>(&text), reinterpret_cast<LPARAM>(rtf.c_str()));
+    AppendPlainText(rich, ("[Picture: " + name + "]\r\n").c_str());
 }

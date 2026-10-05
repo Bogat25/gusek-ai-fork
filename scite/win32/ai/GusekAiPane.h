@@ -19,6 +19,7 @@ class GusekAiPane {
     HWND            m_hStatus;
     HWND            m_hHist;
     HWND            m_hInput;
+    HWND            m_hStrip;
     HWND            m_btnSend;
     HWND            m_btnStop;
     HWND            m_btnCopy;
@@ -28,9 +29,13 @@ class GusekAiPane {
 
     HFONT           m_hFontUi;
     HMODULE         m_hMsftEdit;
+    bool            m_oleInitialized;
 
     // State
     bool            m_busy;
+    bool            m_warming;
+    bool            m_downloadVisionOnly;
+    bool            m_renderPending;
     volatile LONG   m_cancel;
     volatile LONG   m_downloading;
     bool            m_mouseDragging;
@@ -44,6 +49,9 @@ class GusekAiPane {
     ChatMessage     m_pendingQuestion;
     std::vector<ChatImageAttachment> m_attachedImages;
 
+    struct SentPicture { LONG position; ChatImageAttachment image; };
+    std::vector<SentPicture> m_sentPictures;
+
     // Thread synchronization
     CRITICAL_SECTION m_cs;
     std::string     m_pendingBuffer;
@@ -52,6 +60,7 @@ class GusekAiPane {
     HANDLE          m_hDownloadThread;
 
     static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK StripSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
     static LRESULT CALLBACK InputSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
     static LRESULT CALLBACK HistSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 
@@ -63,6 +72,9 @@ class GusekAiPane {
     void AppendTextToInput(const std::string &text);
     void ShowAttachMenu();
     void JoinWorkers();
+    void WarmUp();
+    void AddAttachedImage(ChatImageAttachment &image);
+    void UpdateAttachmentStrip();
     void DiscardWorkerMessages();
     void PostWorkerMessage(UINT message, LONG generation, bool success,
                            const std::string &text = "");
@@ -74,6 +86,7 @@ public:
     bool Create(HWND hParent, int x, int y, int width, int height);
     void Destroy();
     HWND GetHWND() const { return m_hWnd; }
+    HWND GetQuestionHWND() const { return m_hInput; }
 
     void SetPosition(int x, int y, int width, int height);
     void Show(bool bShow);

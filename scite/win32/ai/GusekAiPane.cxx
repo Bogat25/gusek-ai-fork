@@ -17,11 +17,11 @@ struct AiWorkerEvent {
 
 GusekAiPane::GusekAiPane(IGusekAiHost *pHost)
     : m_pHost(pHost),
-      m_hWnd(NULL), m_hStatus(NULL), m_hHist(NULL), m_hInput(NULL),
+      m_hWnd(NULL), m_hStatus(NULL), m_hHist(NULL), m_hInput(NULL), m_hStrip(NULL),
       m_btnSend(NULL), m_btnStop(NULL), m_btnCopy(NULL), m_btnToEd(NULL),
       m_btnNew(NULL), m_btnAttach(NULL),
-      m_hFontUi(NULL), m_hMsftEdit(NULL),
-      m_busy(false), m_cancel(0), m_downloading(0), m_mouseDragging(false),
+      m_hFontUi(NULL), m_hMsftEdit(NULL), m_oleInitialized(SUCCEEDED(OleInitialize(NULL))),
+      m_busy(false), m_warming(false), m_downloadVisionOnly(false), m_renderPending(false), m_cancel(0), m_downloading(0), m_mouseDragging(false),
       m_currentTurnStartPos(0), m_generation(0),
       m_cancelEvent(CreateEvent(NULL, TRUE, FALSE, NULL)), m_postPending(0),
       m_hWorkerThread(NULL), m_hDownloadThread(NULL)
@@ -35,6 +35,7 @@ GusekAiPane::~GusekAiPane() {
     GusekAiImage::Shutdown();
     if (m_cancelEvent) CloseHandle(m_cancelEvent);
     DeleteCriticalSection(&m_cs);
+    if (m_oleInitialized) OleUninitialize();
 }
 
 void GusekAiPane::OnHostQuit() {
@@ -56,6 +57,7 @@ bool GusekAiPane::Create(HWND hParent, int x, int y, int width, int height) {
     size_t lastSlash = appDir.find_last_of("/\\");
     if (lastSlash != std::string::npos) appDir = appDir.substr(0, lastSlash);
     m_config.Load(appDir);
+    if (!m_config.enabled) return false;
 
     WNDCLASSW wc;
     memset(&wc, 0, sizeof(wc));
@@ -90,7 +92,7 @@ bool GusekAiPane::Create(HWND hParent, int x, int y, int width, int height) {
     // 2. Transcript RichEdit
     m_hHist = CreateWindowExW(
         WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
         0, 0, width, height - 160, m_hWnd, (HMENU)IDC_AI_HIST, GetModuleHandle(NULL), NULL);
     GusekAiRender::SetupRichEdit(m_hHist);
     SetWindowSubclass(m_hHist, HistSubclassProc, 1, (DWORD_PTR)this);
@@ -102,6 +104,9 @@ bool GusekAiPane::Create(HWND hParent, int x, int y, int width, int height) {
         "Use Attach to include the current model, last solver error or screenshots.\r\n"
         "Copy code or To editor inserts code into the editor. Nothing is run automatically.\r\n\r\n");
 
+    m_hStrip = CreateWindowExW(0, L"STATIC", L"Attached pictures", WS_CHILD,
+        0, 0, width, 92, m_hWnd, (HMENU)IDC_AI_STRIP, GetModuleHandle(NULL), NULL);
+    SetWindowSubclass(m_hStrip, StripSubclassProc, 3, reinterpret_cast<DWORD_PTR>(this));
     // 3. Question box
     m_hInput = CreateWindowExW(
         WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
@@ -109,6 +114,7 @@ bool GusekAiPane::Create(HWND hParent, int x, int y, int width, int height) {
         0, 0, width, 80, m_hWnd, (HMENU)IDC_AI_INPUT, GetModuleHandle(NULL), NULL);
     GusekAiRender::SetupRichEdit(m_hInput);
     SetWindowSubclass(m_hInput, InputSubclassProc, 2, (DWORD_PTR)this);
+    SendMessage(m_hInput, EM_EXLIMITTEXT, 0, 65536);
 
     // 4. Buttons row
     m_btnSend = CreateWindowExW(0, L"BUTTON", L"Send", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 60, 24, m_hWnd, (HMENU)IDC_AI_SEND, GetModuleHandle(NULL), NULL);
@@ -132,6 +138,8 @@ bool GusekAiPane::Create(HWND hParent, int x, int y, int width, int height) {
 void GusekAiPane::Destroy() {
     OnHostQuit();
     ClearAttachedImages();
+    for (size_t i = 0; i < m_sentPictures.size(); ++i) GusekAiImage::Release(m_sentPictures[i].image);
+    m_sentPictures.clear();
     if (m_hWnd) {
         DestroyWindow(m_hWnd);
         m_hWnd = NULL;
@@ -158,11 +166,7 @@ void GusekAiPane::Show(bool bShow) {
         ShowWindow(m_hWnd, bShow ? SW_SHOW : SW_HIDE);
         if (bShow) {
             SetFocus(m_hInput);
-            if (m_config.autostart && !m_model.CheckHealth(m_config.host, m_config.port)) {
-                // Background warm-up
-                std::string err;
-                // Will start when user asks or during first query
-            }
+            WarmUp();
         }
     }
 }
@@ -183,7 +187,8 @@ void GusekAiPane::LayoutChildren(int width, int height) {
 
     int pad = 4;
     int statusH = 20;
-    int btnH = 26;
+    int buttonRows = width < 390 ? 2 : 1;
+    int btnH = 26 * buttonRows;
     int inputH = 80;
 
     // Status at top
@@ -196,7 +201,9 @@ void GusekAiPane::LayoutChildren(int width, int height) {
     int widths[] = { 50, 45, 60, 68, 62, 65 };
 
     for (int i = 0; i < 6; i++) {
-        SetWindowPos(btns[i], NULL, bx, btnY, widths[i], btnH, SWP_NOZORDER);
+        int row = buttonRows == 2 && i >= 3 ? 1 : 0;
+        if (i == 3 && row) bx = pad;
+        SetWindowPos(btns[i], NULL, bx, btnY + row * 26, widths[i], 24, SWP_NOZORDER);
         bx += widths[i] + 3;
     }
 
@@ -206,7 +213,11 @@ void GusekAiPane::LayoutChildren(int width, int height) {
 
     // Transcript takes the rest
     int histY = statusH + pad * 2;
-    int histH = inputY - histY - pad;
+    int stripHeight = m_attachedImages.empty() ? 0 : 96;
+    int histH = inputY - histY - pad - stripHeight;
+    SetWindowPos(m_hStrip, NULL, pad, inputY - stripHeight - pad, width - pad * 2,
+                 stripHeight, SWP_NOZORDER);
+    ShowWindow(m_hStrip, stripHeight ? SW_SHOW : SW_HIDE);
     if (histH < 40) histH = 40;
     SetWindowPos(m_hHist, NULL, pad, histY, width - pad * 2, histH, SWP_NOZORDER);
 }
@@ -242,42 +253,131 @@ void GusekAiPane::ShowAttachMenu() {
 }
 
 void GusekAiPane::AttachImageFile() {
-    WCHAR szFile[MAX_PATH] = L"";
+    WCHAR szFile[32768] = L"";
     OPENFILENAMEW ofn;
     memset(&ofn, 0, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = m_hWnd;
     ofn.lpstrFilter = L"Images (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif\0All Files (*.*)\0*.*\0";
     ofn.lpstrFile = szFile;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+    ofn.nMaxFile = 32768;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
 
     if (GetOpenFileNameW(&ofn)) {
-        ChatImageAttachment att;
-        if (GusekAiImage::LoadImageFromFile(szFile, att)) {
-            m_attachedImages.push_back(att);
-            SetStatus("Attached picture: " + att.name);
+        std::wstring directory = szFile;
+        const wchar_t *file = szFile + directory.size() + 1;
+        if (!*file) {
+            ChatImageAttachment image;
+            if (GusekAiImage::LoadImageFromFile(directory, image)) AddAttachedImage(image);
+            else SetStatus("Could not read the picture file");
         } else {
-            SetStatus("Failed to load picture file");
+            for (; *file; file += wcslen(file) + 1) {
+                ChatImageAttachment image;
+                if (GusekAiImage::LoadImageFromFile(directory + L"\\" + file, image)) AddAttachedImage(image);
+                else SetStatus("Could not read a selected picture");
+            }
         }
+        if (!m_busy && m_config.vision &&
+            GetFileAttributesW(Utf8ToWide(m_config.resolved_model).c_str()) != INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(Utf8ToWide(m_config.resolved_vision_model).c_str()) == INVALID_FILE_ATTRIBUTES)
+            TriggerFirstRunDownload(true);
     }
 }
 
 void GusekAiPane::AttachClipboardImage() {
-    ChatImageAttachment att;
-    if (GusekAiImage::LoadImageFromClipboard(m_hWnd, att)) {
-        m_attachedImages.push_back(att);
-        SetStatus("Attached image from clipboard");
-    } else {
-        SetStatus("No picture found on clipboard");
+    std::vector<ChatImageAttachment> images;
+    if (GusekAiImage::LoadImagesFromClipboard(m_hWnd, images)) {
+        for (size_t i = 0; i < images.size(); ++i) AddAttachedImage(images[i]);
+        if (!m_busy && m_config.vision &&
+            GetFileAttributesW(Utf8ToWide(m_config.resolved_model).c_str()) != INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(Utf8ToWide(m_config.resolved_vision_model).c_str()) == INVALID_FILE_ATTRIBUTES)
+            TriggerFirstRunDownload(true);
+    } else SetStatus("No picture found on clipboard");
+}
+
+void GusekAiPane::UpdateAttachmentStrip() {
+    if (!m_hWnd || !IsWindow(m_hWnd)) return;
+    RECT rc = {};
+    if (!GetClientRect(m_hWnd, &rc)) return;
+    LayoutChildren(rc.right, rc.bottom);
+    InvalidateRect(m_hStrip, NULL, TRUE);
+}
+
+void GusekAiPane::AddAttachedImage(ChatImageAttachment &image) {
+    if (m_attachedImages.size() >= 16) {
+        GusekAiImage::Release(m_attachedImages[0]);
+        m_attachedImages.erase(m_attachedImages.begin());
     }
+    m_attachedImages.push_back(image);
+    image = ChatImageAttachment();
+    UpdateAttachmentStrip();
+    if (m_attachedImages.size() > 4)
+        SetStatus(std::to_string(m_attachedImages.size()) + " pictures attached; the answer uses the 4 newest pictures.");
+    else SetStatus("Picture attached. Click its preview to open it; x removes it.");
+}
+
+LRESULT CALLBACK GusekAiPane::StripSubclassProc(HWND window, UINT message, WPARAM wp, LPARAM lp,
+                                               UINT_PTR, DWORD_PTR context) {
+    GusekAiPane *pane = reinterpret_cast<GusekAiPane *>(context);
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint;
+        HDC dc = BeginPaint(window, &paint);
+        RECT rc;
+        GetClientRect(window, &rc);
+        FillRect(dc, &rc, reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1));
+        SetBkMode(dc, TRANSPARENT);
+        HFONT oldFont = static_cast<HFONT>(SelectObject(dc, pane->m_hFontUi));
+        int tile = (std::max)(1, static_cast<int>(rc.right) / (std::max)(1, static_cast<int>(pane->m_attachedImages.size())));
+        tile = (std::min)(150, tile);
+        for (size_t i = 0; i < pane->m_attachedImages.size(); ++i) {
+            const ChatImageAttachment &image = pane->m_attachedImages[i];
+            int left = static_cast<int>(i) * tile;
+            BITMAP size;
+            if (image.hThumb && GetObject(image.hThumb, sizeof(size), &size)) {
+                double scale = (std::min)(static_cast<double>((std::max)(1, tile - 18)) / size.bmWidth,
+                                         64.0 / size.bmHeight);
+                int width = (std::max)(1, static_cast<int>(size.bmWidth * scale));
+                int height = (std::max)(1, static_cast<int>(size.bmHeight * scale));
+                HDC memory = CreateCompatibleDC(dc);
+                HGDIOBJ previous = SelectObject(memory, image.hThumb);
+                SetStretchBltMode(dc, HALFTONE);
+                StretchBlt(dc, left + 2, 2, width, height, memory, 0, 0, size.bmWidth, size.bmHeight, SRCCOPY);
+                SelectObject(memory, previous);
+                DeleteDC(memory);
+            }
+            RECT label = { left + 2, 68, left + tile - 2, 90 };
+            DrawTextW(dc, Utf8ToWide(image.name).c_str(), -1, &label, DT_SINGLELINE | DT_END_ELLIPSIS);
+            RECT remove = { left + tile - 17, 0, left + tile, 18 };
+            DrawTextW(dc, L"x", -1, &remove, DT_CENTER | DT_SINGLELINE);
+        }
+        SelectObject(dc, oldFont);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    if (message == WM_LBUTTONUP && !pane->m_attachedImages.empty()) {
+        RECT rc;
+        GetClientRect(window, &rc);
+        int tile = (std::min)(150, (std::max)(1, static_cast<int>(rc.right) / static_cast<int>(pane->m_attachedImages.size())));
+        int x = static_cast<short>(LOWORD(lp)), y = static_cast<short>(HIWORD(lp));
+        size_t index = x < 0 ? pane->m_attachedImages.size() : static_cast<size_t>(x / tile);
+        if (index < pane->m_attachedImages.size()) {
+            if (y < 18 && x % tile >= tile - 17) {
+                GusekAiImage::Release(pane->m_attachedImages[index]);
+                pane->m_attachedImages.erase(pane->m_attachedImages.begin() + index);
+                pane->UpdateAttachmentStrip();
+            } else GusekAiImage::ShowImageViewer(pane->m_hWnd, pane->m_attachedImages[index]);
+        }
+        return 0;
+    }
+    return DefSubclassProc(window, message, wp, lp);
 }
 
 void GusekAiPane::ClearAttachedImages() {
     for (size_t i = 0; i < m_attachedImages.size(); ++i) {
-        if (m_attachedImages[i].hThumb) DeleteObject(m_attachedImages[i].hThumb);
+        GusekAiImage::Release(m_attachedImages[i]);
     }
     m_attachedImages.clear();
+    UpdateAttachmentStrip();
     SetStatus("Attached pictures removed");
 }
 
@@ -329,6 +429,9 @@ void GusekAiPane::NewChat() {
     StopWork();
     ++m_generation;
     m_history.clear();
+    for (size_t i = 0; i < m_sentPictures.size(); ++i) GusekAiImage::Release(m_sentPictures[i].image);
+    m_sentPictures.clear();
+    m_renderPending = false;
     ClearAttachedImages();
     m_lastAnswer.clear();
     m_currentStreamingReply.clear();
@@ -382,11 +485,33 @@ struct WorkerThreadParams {
     GusekAiPane *pPane;
     LONG generation;
     GusekAiConfig config;
+    bool warmup;
     std::string question;
     std::string documentDir;
     std::vector<ChatMessage> history;
     std::vector<std::string> images;
 };
+
+void GusekAiPane::WarmUp() {
+    if (!m_config.autostart || m_busy || m_downloading ||
+        GetFileAttributesW(Utf8ToWide(m_config.resolved_model).c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    JoinWorkers();
+    DiscardWorkerMessages();
+    ++m_generation;
+    InterlockedExchange(&m_cancel, 0);
+    ResetEvent(m_cancelEvent);
+    m_busy = m_warming = true;
+    EnableWindow(m_btnSend, FALSE);
+    EnableWindow(m_btnStop, TRUE);
+    SetStatus("Loading model...");
+    WorkerThreadParams *params = new WorkerThreadParams();
+    params->pPane = this;
+    params->generation = m_generation;
+    params->config = m_config;
+    params->warmup = true;
+    m_hWorkerThread = CreateThread(NULL, 0, WorkerThreadProc, params, 0, NULL);
+    if (!m_hWorkerThread) { delete params; FinishTurn(false); }
+}
 
 void GusekAiPane::SendQuestion() {
     if (m_busy || m_downloading) {
@@ -417,6 +542,22 @@ void GusekAiPane::SendQuestion() {
         return; // Nothing to send
     }
 
+    if (!m_attachedImages.empty()) {
+        if (!m_config.vision) {
+            SetStatus("Picture support is disabled. Remove pictures to ask a text question.");
+            return;
+        }
+        if (GetFileAttributesW(Utf8ToWide(m_config.resolved_model).c_str()) != INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(Utf8ToWide(m_config.resolved_vision_model).c_str()) == INVALID_FILE_ATTRIBUTES) {
+            TriggerFirstRunDownload(true);
+            return;
+        }
+    }
+    if (GetFileAttributesW(Utf8ToWide(m_config.resolved_model).c_str()) == INVALID_FILE_ATTRIBUTES) {
+        TriggerFirstRunDownload(false);
+        return;
+    }
+    GusekAiRender::ScrollToBottom(m_hHist);
     // Clear input
     SetWindowTextW(m_hInput, L"");
 
@@ -424,7 +565,17 @@ void GusekAiPane::SendQuestion() {
     GusekAiRender::AppendHeader(m_hHist, "You", RGB(160, 0, 0));
     if (!m_attachedImages.empty()) {
         for (size_t i = 0; i < m_attachedImages.size(); i++) {
+            SentPicture picture;
+            GETTEXTLENGTHEX length = { GTL_NUMCHARS | GTL_PRECISE, 1200 };
+            picture.position = static_cast<LONG>(SendMessage(m_hHist, EM_GETTEXTLENGTHEX, (WPARAM)&length, 0));
             GusekAiRender::AppendImageThumbnail(m_hHist, m_attachedImages[i].name, m_attachedImages[i].hThumb);
+            picture.image = m_attachedImages[i];
+            m_attachedImages[i].hThumb = m_attachedImages[i].hPreview = NULL;
+            if (m_sentPictures.size() >= 16) {
+                GusekAiImage::Release(m_sentPictures[0].image);
+                m_sentPictures.erase(m_sentPictures.begin());
+            }
+            m_sentPictures.push_back(picture);
         }
     }
     if (!q.empty()) {
@@ -450,6 +601,7 @@ void GusekAiPane::SendQuestion() {
 
     WorkerThreadParams *params = new WorkerThreadParams();
     params->pPane = this;
+    params->warmup = false;
     params->generation = m_generation;
     params->config = m_config;
     params->question = q;
@@ -496,6 +648,11 @@ DWORD WINAPI GusekAiPane::WorkerThreadProc(LPVOID lpParam) {
         return 0;
     }
 
+    if (p->warmup) {
+        pane->PostWorkerMessage(WM_AI_DONE, generation, true);
+        delete p;
+        return 0;
+    }
     {
         std::string sysPrompt = config.GetSystemPrompt() +
             config.GetCourseContext(p->question, p->documentDir);
@@ -510,6 +667,17 @@ DWORD WINAPI GusekAiPane::WorkerThreadProc(LPVOID lpParam) {
             error = "Request failed (Windows error " + std::to_string(http.Error()) + ")";
         } else if (!http.Status(status) || status != 200) {
             error = "Model server returned HTTP status " + std::to_string(status);
+            char errorBody[4096];
+            DWORD errorSize = 0;
+            if (http.Read(errorBody, sizeof(errorBody), errorSize) && errorSize) {
+                std::string explanation;
+                bool ignored = false;
+                std::string record = "data: " + std::string(errorBody, errorSize);
+                size_t key = record.find("\"message\"");
+                if (key != std::string::npos) record.replace(key, 9, "\"content\"");
+                if (GusekAiProtocol::ParseSseDelta(record.c_str(), explanation, ignored) && !explanation.empty())
+                    error += ": " + explanation;
+            }
         } else {
             pane->PostWorkerMessage(WM_AI_STATUS, generation, true, "Answering...");
             char buffer[8192];
@@ -573,17 +741,27 @@ void GusekAiPane::DrainPendingBuffer() {
     InterlockedExchange(&m_postPending, 0);
     LeaveCriticalSection(&m_cs);
 
-    if (text.empty()) return;
-
     m_currentStreamingReply += text;
+    if (text.empty() && !m_renderPending) return;
+    if (m_mouseDragging && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) m_mouseDragging = false;
     if (!m_mouseDragging) {
+        m_renderPending = false;
         GusekAiRender::RenderMarkdownStream(m_hHist, m_currentStreamingReply, m_currentTurnStartPos, false);
     }
 }
 
 void GusekAiPane::FinishTurn(bool success) {
     DrainPendingBuffer();
-    GusekAiRender::RenderMarkdownStream(m_hHist, m_currentStreamingReply, m_currentTurnStartPos, true);
+    if (m_warming) {
+        m_warming = false;
+        m_busy = false;
+        EnableWindow(m_btnSend, TRUE);
+        EnableWindow(m_btnStop, FALSE);
+        SetStatus(success ? "Ready" : "Model warm-up stopped or failed");
+        return;
+    }
+    if (m_mouseDragging && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) m_renderPending = true;
+    else GusekAiRender::RenderMarkdownStream(m_hHist, m_currentStreamingReply, m_currentTurnStartPos, true);
 
     m_lastAnswer = m_currentStreamingReply;
     if (success) {
@@ -592,6 +770,17 @@ void GusekAiPane::FinishTurn(bool success) {
         answer.content = m_lastAnswer;
         m_history.push_back(m_pendingQuestion);
         m_history.push_back(answer);
+        size_t pictureBudget = 4;
+        for (size_t i = m_history.size(); i > 0; ) {
+            --i;
+            std::vector<std::string> &pictures = m_history[i].imageDataUrls;
+            size_t keep = (std::min)(pictureBudget, pictures.size());
+            if (keep < pictures.size()) {
+                pictures.erase(pictures.begin(), pictures.end() - keep);
+                m_history[i].content = "[A picture was attached here; it is no longer shown.]\n" + m_history[i].content;
+            }
+            pictureBudget -= keep;
+        }
         size_t limit = static_cast<size_t>((std::max)(0, m_config.keep_history));
         limit -= limit % 2; // Keep complete user/assistant pairs.
         if (m_history.size() > limit)
@@ -607,6 +796,11 @@ void GusekAiPane::FinishTurn(bool success) {
 }
 
 void GusekAiPane::TriggerFirstRunDownload(bool isVisionOnly) {
+    if ((isVisionOnly ? m_config.vision_url : m_config.model_url).empty()) {
+        SetStatus("Model download is disabled in the configuration");
+        return;
+    }
+    m_downloadVisionOnly = isVisionOnly;
     std::wstring msg = L"The local AI model (Qwen3.5-4B, ~3.4 GB) is not installed.\n"
                        L"Would you like to download it now? It runs completely offline on your CPU.";
     if (isVisionOnly) {
@@ -615,7 +809,7 @@ void GusekAiPane::TriggerFirstRunDownload(bool isVisionOnly) {
     }
 
     if (MessageBoxW(m_hWnd, msg.c_str(), L"Download Local AI Model", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-        JoinWorkers();
+        StopWork();
         DiscardWorkerMessages();
         ++m_generation;
         InterlockedExchange(&m_downloading, 1);
@@ -630,7 +824,7 @@ void GusekAiPane::TriggerFirstRunDownload(bool isVisionOnly) {
             SetStatus("Could not start the download worker");
         }
     } else {
-        SetStatus("Download declined. Model assistant unavailable.");
+        SetStatus(isVisionOnly ? "Picture reader download declined. Text chat is still available." : "Download declined. Model assistant unavailable.");
     }
 }
 
@@ -649,7 +843,7 @@ DWORD WINAPI GusekAiPane::DownloadThreadProc(LPVOID lpParam) {
     GusekAiPane *pane = (GusekAiPane *)lpParam;
 
     std::string err;
-    bool ok = GusekAiDownload::DownloadWithResume(
+    bool ok = pane->m_downloadVisionOnly || GusekAiDownload::DownloadWithResume(
         pane->m_config.model_url,
         pane->m_config.resolved_model,
         pane->m_config.model_sha256,
@@ -682,6 +876,7 @@ void GusekAiPane::HandleDownloadDone(bool success) {
     m_busy = false;
     EnableWindow(m_btnSend, TRUE);
     EnableWindow(m_btnStop, FALSE);
+    if (success) m_model.Stop(); // Next request restarts an owned text-only server with the reader.
     SetStatus(success ? "Model ready. You can now ask questions." : "Download failed or stopped.");
 }
 
@@ -703,7 +898,8 @@ LRESULT CALLBACK GusekAiPane::InputSubclassProc(HWND hWnd, UINT msg, WPARAM wPar
             pPane->AttachClipboardImage();
             return 0;
         }
-        break;
+        SendMessage(hWnd, EM_PASTESPECIAL, CF_UNICODETEXT, 0);
+        return 0;
     }
     return DefSubclassProc(hWnd, msg, wParam, lParam);
 }
@@ -712,6 +908,17 @@ LRESULT CALLBACK GusekAiPane::HistSubclassProc(HWND hWnd, UINT msg, WPARAM wPara
     GusekAiPane *pPane = (GusekAiPane *)dwRefData;
 
     switch (msg) {
+    case WM_LBUTTONDBLCLK: {
+        POINT point = { static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
+        LONG position = static_cast<LONG>(SendMessage(hWnd, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&point)));
+        for (size_t i = 0; i < pPane->m_sentPictures.size(); ++i) {
+            if (position == pPane->m_sentPictures[i].position) {
+                GusekAiImage::ShowImageViewer(pPane->m_hWnd, pPane->m_sentPictures[i].image);
+                return 0;
+            }
+        }
+        break;
+    }
     case WM_LBUTTONDOWN:
         pPane->m_mouseDragging = true;
         break;
@@ -762,13 +969,18 @@ LRESULT CALLBACK GusekAiPane::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             }
             case IDM_AI_ATTACH_OUT: {
                 std::string out = pPane->m_pHost->GetLastSolverOutput();
+                if (out.size() > 16384) out = "[Earlier solver output omitted.]\n" + out.substr(out.size() - 16384);
                 if (!out.empty()) pPane->AppendTextToInput("\n" + out + "\n");
                 else pPane->SetStatus("No solver output available");
                 return 0;
             }
             case IDM_AI_ATTACH_DOC: {
                 std::string doc = pPane->m_pHost->GetActiveDocumentText();
-                if (!doc.empty()) pPane->AppendTextToInput("\n" + doc + "\n");
+                if (!doc.empty()) {
+                    if (doc.size() > 16384) doc = doc.substr(0, 16384) + "\n[Document excerpt truncated.]";
+                    pPane->AppendTextToInput("\nDocument: " + pPane->m_pHost->GetActiveDocumentPath() +
+                        " (" + pPane->m_pHost->GetActiveDocumentFormat() + ")\n" + doc + "\n");
+                }
                 else pPane->SetStatus("No active document");
                 return 0;
             }

@@ -309,7 +309,7 @@ CCFLAGS=$(CCFLAGS) $(INCLUDEDIRS)
 ALL: $(PROG) $(PROGSTATIC) $(DLLS) $(PROPS)
 
 # Native assistant headers are shared by multiple translation units.
-$(AIOBJS): ai\GusekAiDef.h ai\GusekAiConfig.h ai\GusekAiProtocol.h \
+$(AIOBJS) Sc1.obj SciTEWin.obj SciTEWinBar.obj SciTEWinDlg.obj UniqueInstance.obj: ai\GusekAiDef.h ai\GusekAiConfig.h ai\GusekAiProtocol.h \
     ai\GusekAiPane.h ai\GusekAiModel.h ai\GusekAiDownload.h ai\GusekAiHttp.h \
     ai\GusekAiHost.h ai\GusekAiImage.h ai\GusekAiRender.h
 
@@ -463,10 +463,10 @@ $(DIR_BIN)\yaml.properties:	..\src\yaml.properties
 	@echo You must run the Scintilla makefile to build $*.obj
 	@exit 255
 
-SciTERes.res: SciTERes.rc ..\src\SciTE.h ..\..\scintilla\win32\PlatformRes.h
+SciTERes.res: SciTERes.rc SciTE.exe.manifest ..\src\SciTE.h ..\..\scintilla\win32\PlatformRes.h
 	$(RC) $(INCLUDEDIRS) -fo$@ SciTERes.rc
 
-Sc1Res.res: SciTERes.rc ..\src\SciTE.h ..\..\scintilla\win32\PlatformRes.h
+Sc1Res.res: SciTERes.rc SciTE.exe.manifest ..\src\SciTE.h ..\..\scintilla\win32\PlatformRes.h
 	$(RC) $(INCLUDEDIRS) -dSTATIC_BUILD -fo$@ SciTERes.rc
 
 !IF "$(VENDOR)"=="MICROSOFT"

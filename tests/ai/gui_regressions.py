@@ -9,9 +9,13 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import threading
 import time
 import uuid
+
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 
 u = C.WinDLL("user32", use_last_error=True)
 k = C.WinDLL("kernel32", use_last_error=True)
@@ -23,6 +27,18 @@ u.GetClassNameW.argtypes = [W.HWND, W.LPWSTR, C.c_int]
 u.GetDlgCtrlID.argtypes = [W.HWND]
 u.GetWindowLongW.argtypes = [W.HWND, C.c_int]
 u.IsWindowEnabled.argtypes = [W.HWND]
+u.IsWindow.argtypes = [W.HWND]
+u.GetClientRect.argtypes = [W.HWND, C.POINTER(W.RECT)]
+u.GetMenu.argtypes = [W.HWND]
+u.GetMenu.restype = W.HMENU
+u.GetMenuState.argtypes = [W.HMENU, W.UINT, W.UINT]
+u.GetMenuState.restype = W.UINT
+u.GetMenuStringW.argtypes = [W.HMENU, W.UINT, W.LPWSTR, C.c_int, W.UINT]
+class GuiThreadInfo(C.Structure):
+    _fields_ = [("cbSize", W.DWORD), ("flags", W.DWORD), ("active", W.HWND),
+                ("focus", W.HWND), ("capture", W.HWND), ("menu", W.HWND),
+                ("moving", W.HWND), ("caret", W.HWND), ("caret_rect", W.RECT)]
+u.GetGUIThreadInfo.argtypes = [W.DWORD, C.POINTER(GuiThreadInfo)]
 u.ShowWindow.argtypes = [W.HWND, C.c_int]
 u.PostMessageW.argtypes = [W.HWND, W.UINT, W.WPARAM, W.LPARAM]
 u.SendMessageTimeoutW.argtypes = [
@@ -66,6 +82,15 @@ def window_class(hwnd):
     buffer = C.create_unicode_buffer(256)
     u.GetClassNameW(hwnd, buffer, len(buffer))
     return buffer.value
+
+
+def focus(hwnd):
+    info = GuiThreadInfo()
+    info.cbSize = C.sizeof(info)
+    thread = u.GetWindowThreadProcessId(hwnd, None)
+    if not u.GetGUIThreadInfo(thread, C.byref(info)):
+        raise C.WinError(C.get_last_error())
+    return info.focus
 
 
 def windows(parent=None, pid=None):
@@ -123,13 +148,16 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == "/model.gguf":
+        if self.path in ("/model.gguf", "/wrong-range.gguf", "/ignored-range.gguf"):
             offset = int(self.headers.get("Range", "bytes=0-").split("=")[1].split("-")[0])
+            if self.path == "/ignored-range.gguf":
+                offset = 0
             self.send_response(206 if offset else 200)
             self.send_header("Content-Length", str(len(MODEL_DATA) - offset))
             if offset:
                 self.send_header("Content-Range", "bytes %d-%d/%d" %
-                                 (offset, len(MODEL_DATA) - 1, len(MODEL_DATA)))
+                                 (0 if self.path == "/wrong-range.gguf" else offset,
+                                  len(MODEL_DATA) - 1, len(MODEL_DATA)))
             self.end_headers()
             try:
                 for start in range(offset, len(MODEL_DATA), 16384):
@@ -153,12 +181,16 @@ class Fixture(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])).decode())
         question = request["messages"][-1]["content"]
+        if isinstance(question, list):
+            question = next((p["text"] for p in question if p["type"] == "text"), "")
         self.server.requests.append(request)
         if question == "FAIL500":
+            body = b'{"error":{"message":"fixture backend failed"}}'
             self.send_response(500)
-            self.send_header("Content-Length", "0")
+            self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
             self.end_headers()
+            self.wfile.write(body)
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -181,7 +213,8 @@ class Fixture(http.server.BaseHTTPRequestHandler):
                     self.chunk(record[offset:offset + 7])
             else:
                 self.chunk(record)
-            self.chunk(b"data: [DONE]\n\n")
+            if question != "TRUNCATED":
+                self.chunk(b"data: [DONE]\n\n")
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except OSError:
@@ -189,7 +222,8 @@ class Fixture(http.server.BaseHTTPRequestHandler):
 
 
 class App:
-    def __init__(self, stage, root, name, port, missing=False, real_model=None, document=None, bad_hash=False, extra=None):
+    def __init__(self, stage, root, name, port, missing=False, real_model=None, document=None,
+                 bad_hash=False, extra=None, overrides=None, disabled=False, missing_reader=False):
         self.root = root / name
         self.root.mkdir()
         model = self.root / "fixture-model.gguf"
@@ -205,11 +239,26 @@ class App:
             "model_bytes": str(len(MODEL_DATA)), "model_sha256": hashlib.sha256(MODEL_DATA).hexdigest(),
         }
         if real_model:
+            values["autostart"] = "yes"
+            values["model_sha256"] = "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+            values["model_bytes"] = str(real_model.stat().st_size)
+            values["startup_timeout"] = "120"
             values["request_timeout"] = "60"
             values["n_predict"] = "256"
             values["temperature"] = "0.2"
         if bad_hash:
             values["model_sha256"] = "0" * 64
+        if overrides:
+            values.update(overrides)
+        if values["vision"] == "yes":
+            values.setdefault("vision_model", str(self.root / "fixture-reader.gguf"))
+            values.setdefault("vision_url", "http://127.0.0.1:%d/model.gguf" % port)
+            values.setdefault("vision_bytes", str(len(MODEL_DATA)))
+            values.setdefault("vision_sha256", hashlib.sha256(MODEL_DATA).hexdigest())
+            if not missing_reader and not real_model:
+                Path(values["vision_model"]).write_bytes(b"fixture reader; existing backend is reused")
+        if disabled:
+            values["enabled"] = "no"
         (self.root / "GusekAI.ini").write_text(
             "".join("%s=%s\n" % item for item in values.items()), encoding="utf-8")
         os.environ["GUSEK_AI_DATA"] = str(self.root)
@@ -232,9 +281,16 @@ class App:
                 (h for h in windows(pid=self.process.pid) if window_class(h) == "SciTEWindow"), None))
             u.ShowWindow(self.main, 0)
             message(self.main, 0x0111, 470)
+            if disabled:
+                check(not any(window_class(h) == "GusekAiPaneClass" for h in windows(self.main)),
+                      "Disabled AI creates no pane or runtime")
+                check(u.GetMenuState(u.GetMenu(self.main), 470, 0) == 0xFFFFFFFF,
+                      "Disabled AI removes its Tools menu entry")
+                return
             self.pane = wait_for(lambda: next(
                 (h for h in windows(self.main) if window_class(h) == "GusekAiPaneClass"), None))
             self.controls = {u.GetDlgCtrlID(h): h for h in windows(self.pane)}
+            self.before_transcript = text(self.controls[3102])
             check(all(i in self.controls for i in (3101, 3102, 3104, 3105, 3106)),
                   name + ": actual assistant controls exist")
         except BaseException:
@@ -244,11 +300,52 @@ class App:
     def send(self, question):
         buffer = C.create_unicode_buffer(question)
         message(self.controls[3104], 0x000C, 0, C.cast(buffer, C.c_void_p).value)
-        message(self.pane, 0x0111, 3105)
+        before = text(self.controls[3102])
+        self.before_transcript = before
+        u.PostMessageW(self.pane, 0x0111, 3105, 0)
+        # Posted UI commands can open modal dialogs. Completion below waits for
+        # the current answer, not merely an enabled button during UI dispatch.
+        wait_for(lambda: not u.IsWindowEnabled(self.controls[3105]) or
+                 text(self.controls[3102]) != before or
+                 any(window_class(h) == "#32770" for h in windows(pid=self.process.pid)))
+
+    def attach(self, path):
+        u.PostMessageW(self.pane, 0x0111, 3205, 0)
+        dialog = wait_for(lambda: next((h for h in windows(pid=self.process.pid)
+                                      if window_class(h) == "#32770" and "Download" not in text(h)), None))
+        wait_for(lambda: u.GetWindowLongW(dialog, -16) & 0x10000000)
+        time.sleep(0.15)
+        filename = next(h for h in windows(dialog) if window_class(h) == "Edit" and
+                        u.GetDlgCtrlID(h) in (1152, 1148))
+        buffer = C.create_unicode_buffer(str(path))
+        message(filename, 0x000C, 0, C.cast(buffer, C.c_void_p).value)
+        ok = next(h for h in windows(dialog) if u.GetDlgCtrlID(h) == 1 and window_class(h) == "Button")
+        u.PostMessageW(filename, 0x0100, 13, 1)
+        u.PostMessageW(filename, 0x0101, 13, 1)
+        try:
+            wait_for(lambda: not u.IsWindow(dialog))
+            time.sleep(0.05)
+            wait_for(lambda: u.GetWindowLongW(self.controls[3103], -16) & 0x10000000)
+        except TimeoutError:
+            print("Attachment status:", text(self.controls[3101]), flush=True)
+            print("Own dialogs:", [(window_class(h), text(h)) for h in windows(pid=self.process.pid)
+                                  if window_class(h) == "#32770"], flush=True)
+            raise
 
     def complete(self, seconds=10):
-        wait_for(lambda: u.IsWindowEnabled(self.controls[3105]), seconds)
-        return text(self.controls[3102])
+        def finished():
+            if not u.IsWindowEnabled(self.controls[3105]):
+                return False
+            status = text(self.controls[3101])
+            transcript = text(self.controls[3102])
+            fresh = transcript[len(self.before_transcript):]
+            if status == "Ready" and "GUSEK assistant" in fresh and fresh.rsplit("GUSEK assistant", 1)[-1].strip():
+                return (transcript,)
+            if status.startswith(("Model error:", "Model server returned", "Model stream ended",
+                                  "Request failed", "Stream failed")):
+                return (transcript,)
+            return False
+        return wait_for(finished, seconds)[0]
 
     def dialog(self, answer):
         dialog = wait_for(lambda: next(
@@ -263,6 +360,14 @@ class App:
                 try:
                     self.process.wait(timeout=3)
                     check(self.process.returncode == 0, "GUSEK exits cleanly with active work")
+                except subprocess.TimeoutExpired:
+                    print("Shutdown own dialogs:", [(window_class(h), text(h)) for h in windows(pid=self.process.pid)
+                                                   if window_class(h) == "#32770"], flush=True)
+                    for dialog in windows(pid=self.process.pid):
+                        if window_class(dialog) == "#32770":
+                            print("Shutdown explanation:", [text(h) for h in windows(dialog)
+                                                            if window_class(h) == "Static"], flush=True)
+                    raise
                 finally:
                     if self.process.poll() is None:
                         self.process.terminate()
@@ -271,7 +376,7 @@ class App:
             self.process.wait(timeout=5)
 
 
-def exercise(stage, root):
+def exercise(stage, root, fixtures):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
     server.requests = []
     server.waiting = threading.Event()
@@ -282,6 +387,17 @@ def exercise(stage, root):
         app = App(stage, root, "chat", server.server_port)
         visible = lambda: bool(u.GetWindowLongW(app.pane, -16) & 0x10000000)
         check(visible(), "Menu shows assistant pane")
+        check(focus(app.main) == app.controls[3104], "Opening the pane focuses the question box")
+        u.PostMessageW(app.controls[3104], 0x0100, 9, 1)
+        wait_for(lambda: focus(app.main) == app.controls[3105])
+        check(True, "Tab reaches the enabled Send button from the question box")
+        buffer = C.create_unicode_buffer("KEYBOARD SEND")
+        message(app.controls[3104], 0x000C, 0, C.cast(buffer, C.c_void_p).value)
+        u.PostMessageW(app.controls[3105], 0x0100, 13, 1)
+        wait_for(lambda: "ANSWER_FOR_KEYBOARD SEND" in text(app.controls[3102]))
+        app.complete()
+        check(True, "Enter activates a focused assistant button")
+        message(app.pane, 0x0111, 3109)
         message(app.main, 0x0111, 470)
         check(not visible(), "Menu hides assistant pane")
         message(app.main, 0x0111, 470)
@@ -299,6 +415,10 @@ def exercise(stage, root):
         app.send("FAIL500")
         app.complete()
         check("500" in text(app.controls[3101]), "HTTP failure remains visible")
+        check("fixture backend failed" in text(app.controls[3101]), "Backend error includes its useful explanation")
+        app.send("TRUNCATED")
+        app.complete()
+        check("before completion" in text(app.controls[3101]), "Incomplete SSE stream fails visibly")
         app.send("RECOVERED")
         check("ANSWER_FOR_RECOVERED" in app.complete(), "Another request succeeds after HTTP failure")
         app.send("HANG")
@@ -328,6 +448,87 @@ def exercise(stage, root):
         check(message(editor, 2137) == 65001, "Unrepresentable code opens a UTF-8 document")
         check(editor_bytes(editor, app.process.pid) == "# 测试\nvar x >= 0;".encode(),
               "To editor preserves every Unicode character")
+        app.close()
+        app = App(stage, root, "disabled", server.server_port, disabled=True)
+        app.close()
+        with socket.socket() as free:
+            free.bind(("127.0.0.1", 0))
+            unused_port = free.getsockname()[1]
+        app = App(stage, root, "no-autostart", unused_port)
+        app.send("NO AUTOMATIC SERVER")
+        app.complete()
+        check("autostart" in text(app.controls[3101]).lower(), "autostart=no does not launch a server")
+        app.close()
+        course = root / "árvíztűrő-课程"
+        course.mkdir()
+        (course / "课程.md").write_text("UNICODE_COURSE_SENTINEL optimization", encoding="utf-8")
+        (course / "README.md").write_text("EXCLUDED_README_SENTINEL", encoding="utf-8")
+        app = App(stage, root, "árvíztűrő-测试", server.server_port,
+                  overrides={"context_dir": str(course), "hotkey": "K"})
+        label = C.create_unicode_buffer(256)
+        u.GetMenuStringW(u.GetMenu(app.main), 470, label, len(label), 0)
+        check("Ctrl+Shift+K" in label.value, "The configured shortcut is displayed in the Tools menu")
+        (app.root / "system_prompt.txt").write_text("CUSTOM_PROMPT_SENTINEL", encoding="utf-8")
+        app.send("optimization")
+        app.complete()
+        system = server.requests[-1]["messages"][0]["content"]
+        (app.root / "sent-system.txt").write_text(system, encoding="utf-8")
+        check("CUSTOM_PROMPT_SENTINEL" in system and "UNICODE_COURSE_SENTINEL" in system,
+              "Unicode data and course paths load editable prompts and notes")
+        check("EXCLUDED_README_SENTINEL" not in system, "Course instructions exclude README scaffolding")
+        app.close()
+        app = App(stage, root, "pictures", server.server_port, overrides={"vision": "yes"})
+        picture = fixtures / "picture-42.png"
+        app.attach(picture)
+        strip = app.controls[3103]
+        message(strip, 0x0202, 0, 10 | (25 << 16))
+        viewer = wait_for(lambda: next((h for h in windows(pid=app.process.pid)
+                                      if window_class(h) == "GusekAiImageViewer"), None))
+        message(viewer, 0x0100, 27)
+        check(not any(window_class(h) == "GusekAiImageViewer" for h in windows(pid=app.process.pid)),
+              "Attachment opens a picture viewer and Escape closes it")
+        app.attach(fixtures / "picture-42.jpg")
+        rc = W.RECT()
+        u.GetClientRect(strip, C.byref(rc))
+        tile = min(150, rc.right // 2)
+        message(strip, 0x0202, 0, (tile - 5) | (5 << 16))
+        app.send("")
+        app.complete()
+        parts = server.requests[-1]["messages"][-1]["content"]
+        check(sum(p["type"] == "image_url" for p in parts) == 1,
+              "Per-picture removal keeps the remaining attachment")
+        check(any(p["type"] == "text" and p["text"] for p in parts), "Image-only send supplies a useful question")
+        check(not (u.GetWindowLongW(strip, -16) & 0x10000000), "Send transfers pictures from the attachment strip")
+        for i in range(5):
+            app.attach(picture)
+        app.send("NEW PICTURES")
+        app.complete()
+        messages = server.requests[-1]["messages"]
+        (app.root / "picture-requests.json").write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+        total = sum(p["type"] == "image_url" for m in messages if isinstance(m["content"], list) for p in m["content"])
+        check(total == 4 and isinstance(messages[1]["content"], str) and "picture" in messages[1]["content"],
+              "Picture follow-up retains only the four newest images and marks older images")
+        app.send("TEXT FOLLOW-UP")
+        app.complete()
+        check(isinstance(server.requests[-1]["messages"][-3]["content"], list),
+              "Text follow-up still includes the previous picture turn")
+        app.close()
+        app = App(stage, root, "reader-only", server.server_port,
+                  overrides={"vision": "yes"}, missing_reader=True)
+        base_before = (app.root / "fixture-model.gguf").read_bytes()
+        app.attach(picture)
+        app.dialog(7)
+        message(app.pane, 0x0111, 3207)
+        app.send("TEXT WITHOUT READER")
+        check("ANSWER_FOR_TEXT WITHOUT READER" in app.complete(), "Declining the picture reader preserves text chat")
+        app.attach(picture)
+        app.dialog(6)
+        wait_for(lambda: "Model ready" in text(app.controls[3101]), 15)
+        check((app.root / "models/fixture-reader.gguf").read_bytes() == MODEL_DATA and
+              (app.root / "fixture-model.gguf").read_bytes() == base_before,
+              "Reader-only installation verifies the reader and preserves the base model")
+        app.send("PICTURE AFTER READER")
+        check("ANSWER_FOR_PICTURE AFTER READER" in app.complete(), "Picture works after reader installation without restarting GUSEK")
         app.close()
         legacy_document = root / "legacy.mod"
         original = b"# keep existing model\nvar y;\n"
@@ -379,6 +580,23 @@ def exercise(stage, root):
         check(not (app.root / "models/fixture-model.gguf").exists(),
               "A bad model checksum cannot become an installed model")
         app.close()
+        for name, route in (("bad-range", "/wrong-range.gguf"), ("ignored-range", "/ignored-range.gguf"),
+                            ("corrupt-complete-part", "/model.gguf")):
+            app = App(stage, root, name, server.server_port, missing=True,
+                      overrides={"model_url": "http://127.0.0.1:%d%s" % (server.server_port, route)})
+            part = app.root / "models/fixture-model.gguf.part"
+            part.write_bytes(b"X" * len(MODEL_DATA) if name == "corrupt-complete-part" else MODEL_DATA[:65536])
+            app.send("RESUME DOWNLOAD")
+            app.dialog(6)
+            if name == "bad-range":
+                wait_for(lambda: "range" in text(app.controls[3101]).lower(), 15)
+                check(u.IsWindowEnabled(app.controls[3105]) and not (app.root / "models/fixture-model.gguf").exists(),
+                      "Invalid Content-Range fails visibly without installing a corrupt model")
+            else:
+                wait_for(lambda: "Model ready" in text(app.controls[3101]), 15)
+                check((app.root / "models/fixture-model.gguf").read_bytes() == MODEL_DATA,
+                      name + ": download restarts and verifies the complete model")
+            app.close()
         document = root / "solver.mod"
         document.write_text('printf {i in 1..2000} "line %d\\n", i;\nend;\n', encoding="utf-8")
         server.waiting.clear()
@@ -416,12 +634,40 @@ def exercise(stage, root):
         server.server_close()
 
 
-def real_inference(stage, root, model):
+def real_inference(stage, root, model, reader, fixtures):
+    class ReaderFixture(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *unused):
+            pass
+
+        def do_GET(self):
+            offset = int(self.headers.get("Range", "bytes=0-").split("=")[1].split("-")[0])
+            size = reader.stat().st_size
+            self.send_response(206 if offset else 200)
+            self.send_header("Content-Length", str(size - offset))
+            if offset:
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (offset, size - 1, size))
+            self.end_headers()
+            try:
+                with reader.open("rb") as stream:
+                    stream.seek(offset)
+                    while data := stream.read(65536):
+                        self.wfile.write(data)
+            except OSError:
+                pass
+
+    source = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ReaderFixture)
+    threading.Thread(target=source.serve_forever, daemon=True).start()
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    app = App(stage, root, "real-model", port, real_model=model)
+    app = App(stage, root, "real-model", port, real_model=model, missing_reader=True,
+              overrides={"vision": "yes", "vision_model": str(root / "real-model/models/reader.gguf"),
+                         "vision_url": "http://127.0.0.1:%d/reader.gguf" % source.server_port,
+                         "vision_bytes": str(reader.stat().st_size),
+                         "vision_sha256": "cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864"})
     try:
+        wait_for(lambda: u.IsWindowEnabled(app.controls[3105]), 120)
+        check(text(app.controls[3101]) == "Ready", "Actual CPU model warms up without blocking the UI")
         app.send("Create a complete GNU MathProg linear program with exactly one scalar "
                  "decision variable named x. Declare x with var BEFORE defining the objective, maximize x, and constrain "
                  "x <= 5. Include solve; and end;. Use no sets, indexed quantities, or "
@@ -444,6 +690,26 @@ def real_inference(stage, root, model):
         check(result.returncode == 0 and b"OPTIMAL" in result.stdout,
               "Test explicitly solves the generated MathProg model")
         message(editor, 2014)  # Mark this test's scratch buffer clean.
+        picture = app.root / "number.png"
+        picture.write_bytes((fixtures / "picture-42.png").read_bytes())
+        app.attach(picture)
+        app.dialog(6)
+        wait_for(lambda: "Model ready" in text(app.controls[3101]), 120)
+        check((app.root / "models/reader.gguf").stat().st_size == reader.stat().st_size,
+              "Reader-only download installs the actual pinned projector")
+        with socket.socket() as sock:
+            sock.settimeout(1)
+            check(sock.connect_ex(("127.0.0.1", port)) != 0,
+                  "Installing the reader stops the text-only owned server for restart")
+        app.send("Read the two-digit number printed in the picture. Reply with that number only.")
+        transcript = app.complete(180)
+        answer = transcript.rsplit("GUSEK assistant", 1)[-1]
+        check("42" in answer, "Actual CPU vision reads the number from the attached picture")
+        app.send("What is half the number in that picture? Reply with the result only.")
+        transcript = app.complete(120)
+        answer = transcript.rsplit("GUSEK assistant", 1)[-1]
+        check("21" in answer, "Actual picture history supports a later text-only follow-up")
+        (app.root / "vision-transcript.txt").write_text(transcript, encoding="utf-8")
         app.send("Explain how the constraint bounds the optimum.")
         wait_for(lambda: "Answering" in text(app.controls[3101]), 10)
         app.close(graceful=True)
@@ -453,6 +719,8 @@ def real_inference(stage, root, model):
                   "Closing GUSEK stops its owned real model server")
     finally:
         app.close()
+        source.shutdown()
+        source.server_close()
 
 
 if __name__ == "__main__":
@@ -460,13 +728,18 @@ if __name__ == "__main__":
     parser.add_argument("--stage", type=Path, required=True)
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--real-model", type=Path)
+    parser.add_argument("--real-reader", type=Path)
+    parser.add_argument("--fixtures", type=Path)
     options = parser.parse_args()
     root = options.work_root / ("gui-" + uuid.uuid4().hex)
     root.mkdir(parents=True)
     (root / "tmp").mkdir()
     os.environ["TEMP"] = os.environ["TMP"] = str(root / "tmp")
     if options.real_model:
-        real_inference(options.stage, root, options.real_model)
+        if not options.real_reader:
+            parser.error("--real-model requires --real-reader")
+        real_inference(options.stage, root, options.real_model, options.real_reader,
+                       options.fixtures or options.work_root / "native")
     else:
-        exercise(options.stage, root)
+        exercise(options.stage, root, options.fixtures or options.work_root / "native")
     print("GUI regression checks passed:", CHECKS, flush=True)

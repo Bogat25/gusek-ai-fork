@@ -19,7 +19,7 @@ public:
         HANDLE cancelEvent = NULL);
 
     static bool VerifyFileSha256(const std::string &filePath, const std::string &expectedSha256,
-                                volatile LONG *cancelFlag = NULL);
+                                volatile LONG *cancelFlag = NULL, HANDLE cancelEvent = NULL);
 };
 
 #endif // GUSEK_AI_DOWNLOAD_H

@@ -1,93 +1,159 @@
-# GUSEK AI validation
+# GUSEK AI release validation
 
-Date: 2026-10-05. Reviewed baseline: `574af4f9c3485e95693e463166d5f02fdcc0138c`.
+Date: 2026-10-05. Reviewed baseline: `b46d8b05d11801410a41001d0031a4d02b0bee7f`, plus the changes in this commit.
 
-The reviewed chat, build-wrapper and installer defects have been fixed and tested locally. This report covers those fixes; it does not certify every feature in the original integration plan.
+The local release checks pass on an unelevated Windows 11 Pro x64 session
+(OS build 10.0.26200). Version 0.1.1 installer and portable packages are built.
+The GitHub release workflow is prepared locally; no GitHub workflow was
+triggered and no release was published.
 
-## Fixes verified
+## Changes and evaluation
 
-- First-run model download: declining, pausing, resuming, failing verification and completing a download leave the controls usable. A completed download supports inference without restarting GUSEK.
-- Streaming: WinHTTP decodes HTTP chunks before SSE parsing, including records and Unicode characters split across chunks. HTTP and stream failures remain visible after the controls recover.
-- Conversation: successful user/assistant pairs are retained within the configured message limit and included in follow-up requests. New chat clears history and discards old worker messages.
-- Worker lifetime: Stop, New chat and shutdown signal cancellation, join owned request/download workers and finish asynchronous HTTP callbacks before releasing pane state. Closing GUSEK also stops its owned model server.
-- To editor: conversion to an existing legacy encoding must be lossless. Otherwise the code opens in a new UTF-8 document when a tab is available. When no tab is available, the existing document and its encoding are preserved and insertion failure is reported.
-- Solver output: job-thread writes and assistant reads share the existing job mutex. The GUI suite exercises attachment while GLPK produces output and a model request remains active.
-- Build/test wrapper: the requested BuildRoot reaches the harness, failures propagate to the caller, and native tests are freshly compiled. GUI tests require the actual staged application and controls. Source synchronization excludes local build products, and shared AI header changes trigger recompilation.
-- Portable profile: SciTE_USERHOME now takes precedence for user settings, matching Start-Gusek.cmd.
-- Installer: uninstall deletes only the two named default model assets and their partial files. Custom models, coursework, settings, prompts and saved-history files survive. Windows installer version metadata derives from the supplied version.
+The previous worker, history, Unicode insertion and installer preservation
+fixes remain covered by regression tests. This pass completes the attachment
+strip, real transcript thumbnails, full-size picture viewer, separate reader
+download and restart, background model warm-up, disabled-AI behavior,
+configurable shortcut and keyboard navigation.
 
-The default MathProg prompt also states declaration order explicitly. In the real inference test, generated code was sent to the editor and separately checked with GLPK; it solved successfully with an objective value of 5. This is evidence for that response, not a guarantee that every model response will be valid.
+An incremental build defect was found during shutdown validation: the host
+could keep an old allocation size after the pane headers changed. The makefile
+now rebuilds host translation units that consume those headers. Both the debug
+heap check that exposed the defect and the subsequent release GUI shutdown
+checks pass. Manifest changes also trigger resource recompilation. Build
+scripts explicitly select the release runtime and replace an older build
+mirror before changing its compiler mode.
 
-## Local validation
+Configuration, model launch, image files, downloads and course lookup use
+Unicode Windows APIs. Editable per-user prompts and course notes are read for
+each question. Course search excludes README scaffolding, oversized files and
+reparse points, bounds input reads, and accounts for excerpt headers and
+omission markers within its total budget. It searches designated context
+folders rather than every neighboring document.
 
-The editor was freshly built with MSVC x86. CPU inference used the SHA-256-pinned x64 llama.cpp b11153 runtime and Qwen3.5-4B-Q4_K_M model. Test profiles, temporary files and installer data were isolated under a new build directory.
+Picture requests retain the four newest images across the question and
+history; discarded images leave a marker. The attachment strip allows
+individual removal and warns when more than four pictures are attached.
+Five file formats, EXIF orientation, dimension limits, JPEG fallback, embedded
+PNG transcript data, viewer ownership, Unicode streaming, emoji font selection,
+scroll position and selection preservation are checked in actual controls.
 
-Full test command:
+Downloads verify complete files before installation, reject incorrect range
+responses, restart when a server ignores Range, and recover from a corrupt
+complete partial file. Owned runtime launches verify model hashes, respect
+autostart=no and use the dedicated loopback endpoint. Runtime model lookup
+uses the application's own profile or an explicit path. Build and test tools
+may reuse verified, public model caches; normal application use does not
+implicitly select RGui or RStudio cache folders.
 
-```powershell
-.\gusek.cmd test -Real -Installer -BuildRoot D:\gusek-fixes-28308006dbef4a359b07fbdae40ae4db
-```
+The model and projector URLs now name immutable upstream revision
+`e87f176479d0855a907a41277aca2f8ee7a09523`. Its public file metadata matches both
+configured SHA-256 pins and byte sizes. The runtime remains pinned to
+llama.cpp b11153. Inno Setup 7.1.0 is downloaded with its SHA-256 pin and
+installed into the build folder for the current user. The packages include
+usage instructions, GPL text and the relevant Scintilla, SciTE, llama.cpp
+and LLVM OpenMP notices.
 
-The wrapper returned exit code 0. All requested suites passed:
+## Validation results
 
-| Suite | Result | Scope |
+| Suite | Result | Evidence |
 |---|---|---|
-| Fresh native tests | 53/53 | JSON, Unicode, think filtering, code extraction, SSE, config, course context, download and verification |
-| Build-wrapper regressions | Passed | BuildRoot forwarding, failure/success exit codes, valid and invalid Windows version conversion |
-| Actual staged GUSEK GUI | 35 checks passed | History, split chunked Unicode, HTTP error recovery, Stop, New chat, first-run download, Unicode insertion, full tabs, concurrent solver output and shutdown |
-| Real CPU inference through GUSEK | 5 checks passed | Actual pane, generated MathProg, GLPK validation, shutdown during a follow-up and owned server cleanup |
-| Installer regressions | 34 checks passed | Metadata, checksum, components, model-free payload, upgrade preservation and uninstall ownership |
-| Actual installed GUSEK GUI | 35 checks passed | Same application regressions from an installation path containing spaces |
-| Extracted portable GUSEK GUI | 35 checks passed | Same regressions after relocating the ZIP to a path containing spaces |
+| Fresh native tests | 87/87 passed | Protocol, Unicode, configuration, bounded context, downloads, pictures and actual RichEdit behavior |
+| Build and release helpers | Passed | BuildRoot forwarding, exit codes, Windows version metadata, valid/invalid tags, prereleases, manual versions and unsafe-root rejection |
+| Actual staged GUI | 65 checks passed | Controls, focus, Tab/Enter, shortcut label, streaming/error recovery, history, attachments, reader-only installation, download recovery, solver attachment and shutdown |
+| Actual installed GUI | 65 checks passed | Same regressions under the default per-user installation path containing spaces |
+| Actual portable GUI | 65 checks passed | Same regressions after extracting the release ZIP to a new folder containing spaces |
+| Installer assertions | 50 passed | Metadata, checksums, asInvoker manifests, default user destination, HKCU registration, no HKLM registration, payload, upgrade and uninstall preservation |
+| Packaged launchers | 4 checks passed | Actual Start menu shortcut and portable command launcher open their own app and exit cleanly |
+| Real CPU text and vision | 10 checks passed | Background warm-up, generated MathProg, GLPK solving, reader-only download/restart, picture recognition, image history and owned runtime cleanup |
+| Workflow/static checks | Passed | PowerShell parsing, actionlint, release publisher Bash syntax and git diff --check |
 
-Installer tests compile the same packaging source with a unique AppId, shortcut name and explicit isolated data directory. They install, upgrade and uninstall that test identity. The normal production installer was compiled and inspected, but was not installed into the user's profile.
+The installer suite compiles the same packaging source with a unique AppId,
+application/shortcut name and isolated assistant data directory. It installs
+without a /DIR override into LocalAppData Programs, runs the app, upgrades it
+and uninstalls it. The caller's administrator role was false. Setup, application
+and uninstaller manifests request asInvoker; the normal production installer
+was compiled and inspected, while the test identity was used for installation.
 
-PowerShell parsing, actionlint for the existing tag workflow, and git diff --check also passed. The portable ZIP contains 292 entries, the model runtime and launcher, and zero GGUF files.
+Upgrade preserves customized shipped defaults and all model fixtures.
+Uninstall removes only the named default model assets and their partial files.
+Custom models, coursework, user settings, prompts and saved-history fixture
+files survive. Conversation persistence is not implemented: normal chat
+history stays in memory.
 
-Evidence on this machine:
+The real CPU test used the pinned base model and projector through the actual
+GUSEK pane. Its generated model solved with objective 5 in GLPK. Starting from
+a text-only server, the test installed the reader through the reader-only flow,
+verified that the old owned server stopped, and restarted inference with vision.
+The model read 42 from a picture whose filename did not reveal the number, then
+answered 21 to a text-only follow-up asking for half of it. Closing the app
+during another request returned exit code 0 and closed its owned server port.
+This validates those responses, not every possible generated model.
 
-- Build/package logs: D:\gusek-fixes-28308006dbef4a359b07fbdae40ae4db\logs (final-build.log, package-command.log, installer-command.log).
-- Full suite log: D:\gusek-fixes-28308006dbef4a359b07fbdae40ae4db\logs\all-tests-final.log.
-- Test files, native logs, real-model transcript, generated model and GLPK output: D:\gusek-fixes-28308006dbef4a359b07fbdae40ae4db\tests\run-ba5720277575480ca8cb54d22f9f0f91.
-- Portable relocation log: D:\gusek-fixes-28308006dbef4a359b07fbdae40ae4db\logs\portable-regressions.log.
+## Release workflow
 
-These local evidence paths are not included in Git or distribution packages.
+`.github/workflows/windows-installer.yml` validates pushed version tags such as
+v0.1.1 and v0.2.0-rc1. A Windows build job with read-only repository permissions
+fetches pinned tools, builds, runs native/GUI checks, creates both packages and
+checks installation, upgrade, uninstall and portable relocation. Models are
+excluded. Pinned action revisions are used and checkout credentials are not
+persisted.
 
-## Distribution artifacts
+A separate Ubuntu job runs only for tag push events, verifies package checksums,
+and uploads the installer, ZIP and checksum files into a draft release before
+publishing it. Prereleases are marked appropriately. Manual runs only produce
+Actions artifacts. Existing releases are not overwritten.
 
-Both packages were created from the fixed source with version 0.1.0 under D:\gusek-fixes-28308006dbef4a359b07fbdae40ae4db\dist.
+## Artifacts and local evidence
+
+Build root: `D:\gusek-production-ceb842debe7b4491a332668cacaae638`.
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| gusek-0.1.0-portable.zip | 21,891,596 | `8946adbdf9cf5bf5ccadb006df52ab5a3a3e48699ebcf564c69eff3fa9fa0051` |
-| gusek-ai-0.1.0-setup.exe | 13,759,217 | `224e7e68aa9079fc38504691a93b1e3f395cabfae0ae0afa0cbd8e04505b7d3f` |
+| gusek-0.1.1-portable.zip | 21,738,446 | `a2a6cc4e75f1672a48f632b92aca8954111d0e585ed85d09d5367146b3e7ff63` |
+| gusek-ai-0.1.1-setup.exe | 13,695,718 | `961cb3903526445f4ebbbca3cf99856ee462f4969a3c85e6450bfbe36bf18428` |
 
-Each has an adjacent .sha256 file. The installer reports Windows file version 0.1.0.0. The packages include the runtime and exclude the large models.
+Artifacts and adjacent ASCII .sha256 files are in BuildRoot\dist.
+Installer file version is 0.1.1.0. The ZIP contains 298 entries, zero GGUF
+files and no test or work-profile directories.
 
-## Reproducing the checks
+The final distribution suite returned exit code 0:
+`logs\production-distribution-final.log`, with fixtures under
+`tests\run-03385667b236405f8fe5aadb5ef5830f`.
+Real inference evidence is in `logs\production-tests-release.log` and
+`tests\run-d496db08889d4a75baf00656f9c33e04`, including the generated model,
+GLPK output, vision transcript and local runtime logs. Build/package output is
+in `logs\production-package.log` and `logs\production-installer.log`.
+Release-helper rejection cases are in `logs\release-build-guards.log`.
+These machine-local evidence paths and binaries are excluded from Git.
 
-Use Windows x64, MSVC C++ tools and Python 3. Installer builds/tests also require Inno Setup. Choose an absolute BuildRoot without spaces; the repository, installed app and portable app may live in paths with spaces.
+## Reproduce
+
+Use Windows x64, MSVC C++ tools and Python 3. Choose an absolute writable
+BuildRoot without spaces, outside the repository.
 
 ```powershell
-.\gusek.cmd doctor -BuildRoot D:\gusek-build
 .\gusek.cmd fetch -NoModel -BuildRoot D:\gusek-build
 .\gusek.cmd full -BuildRoot D:\gusek-build
-.\gusek.cmd test -BuildRoot D:\gusek-build
-.\gusek.cmd package -Version 0.1.0 -BuildRoot D:\gusek-build
-.\gusek.cmd installer -Version 0.1.0 -BuildRoot D:\gusek-build
+.\gusek.cmd package -Version 0.1.1 -BuildRoot D:\gusek-build
+.\gusek.cmd installer -Version 0.1.1 -BuildRoot D:\gusek-build
 .\gusek.cmd test -Installer -BuildRoot D:\gusek-build
 ```
 
-fetch -NoModel downloads the pinned llama.cpp runtime, not the Inno Setup compiler or model files. Install Inno Setup separately or supply -InnoSetup when building the installer. Installer tests discover the compiler in the standard installation or supported cache locations; see Find-InnoSetup in gusek.ps1.
+For CPU text and vision validation, run fetch without -NoModel, then test
+-Real -Installer. Requested suites fail if prerequisites are missing.
+The default test command includes fresh native and actual GUI checks.
+See AI-README.md for use, configuration, build and release instructions.
 
-For real inference checks, run fetch without -NoModel first, or use an already cached pinned model. Then run:
+## Limits
 
-```powershell
-.\gusek.cmd test -Real -Installer -BuildRoot D:\gusek-build
-```
+The packages are unsigned; Windows reputation checks can show a warning.
+Signing requires a separately provisioned certificate and is not configured.
+The first GitHub-hosted run remains unvalidated because GitHub access was
+kept read-only. The hosted workflow runs the native and simulated-backend GUI
+suites, without downloading multi-gigabyte models; real CPU text/vision was
+validated locally.
 
-The default test command always runs GUI regressions in addition to the native and wrapper checks. -Real and -Installer add their respective suites; requested suites fail if their prerequisites are missing. Tests preserve logs in a unique BuildRoot\tests\run-* directory.
-
-## Remaining validation scope
-
-Real vision inference, the complete picture attachment/thumbnail workflow, broader manual layout/accessibility review and a GitHub-hosted workflow execution were not validated here. No GitHub workflow was triggered and no release was published. Generated models still require review and solver validation before use.
+Windows 10, ARM64 emulation, GPU execution, diverse clipboard applications and
+a comprehensive manual accessibility/visual review were not tested. The
+installer targets Windows 10 1903+; the measured results here are for Windows
+11 x64. Generated models still need user review and explicit solver validation.

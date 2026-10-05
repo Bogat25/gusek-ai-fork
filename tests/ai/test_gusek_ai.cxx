@@ -249,7 +249,8 @@ static void TestConfigAndCourseContext() {
         fclose(fr);
     }
 
-    std::string ctxResult = cfg.GetCourseContext("How do I define shipment capacity and demand constraints?", testCtx);
+    cfg.resolved_context_dir = testCtx;
+    std::string ctxResult = cfg.GetCourseContext("How do I define shipment capacity and demand constraints?", "");
     TEST_ASSERT(ctxResult.find("transp.mod") != std::string::npos, "CourseContext includes transp.mod");
     TEST_ASSERT(ctxResult.find("README.txt") == std::string::npos, "CourseContext excludes README.txt");
     TEST_ASSERT(ctxResult.find("PLANTS") != std::string::npos, "CourseContext includes relevant excerpts");
@@ -405,7 +406,10 @@ static void TestNetworkIntegration(int port) {
 // ---------------------------------------------------------------------
 // Main runner
 // ---------------------------------------------------------------------
+#include "production_checks.h"
+
 int main(int argc, char **argv) {
+    OleInitialize(NULL);
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
 
@@ -422,6 +426,7 @@ int main(int argc, char **argv) {
     TestSseParsing();
     printf("\n");
     TestConfigAndCourseContext();
+    if (argc > 2) TestProduction(Utf8ToWide(argv[2]));
 
     if (argc > 1) {
         int port = atoi(argv[1]);
@@ -436,5 +441,6 @@ int main(int argc, char **argv) {
     printf("============================================================\n");
 
     WSACleanup();
+    OleUninitialize();
     return (g_testsFailed == 0) ? 0 : 1;
 }

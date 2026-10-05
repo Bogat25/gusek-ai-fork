@@ -22,20 +22,21 @@ static std::string ToLower(const std::string &s) {
 }
 
 static bool FileExists(const std::string &path) {
-    DWORD dwAttrib = GetFileAttributesA(path.c_str());
+    DWORD dwAttrib = GetFileAttributesW(Utf8ToWide(path).c_str());
     return (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
 }
 
 static bool DirExists(const std::string &path) {
-    DWORD dwAttrib = GetFileAttributesA(path.c_str());
+    DWORD dwAttrib = GetFileAttributesW(Utf8ToWide(path).c_str());
     return (dwAttrib != INVALID_FILE_ATTRIBUTES && (dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
 }
 
 static void ParseIniFile(const std::string &path, std::map<std::string, std::string> &kv) {
-    std::ifstream in(path.c_str());
+    std::ifstream in(Utf8ToWide(path).c_str());
     if (!in.is_open()) return;
     std::string line;
     while (std::getline(in, line)) {
+        if (line.compare(0, 3, "\xef\xbb\xbf") == 0) line.erase(0, 3);
         line = Trim(line);
         if (line.empty() || line[0] == '#' || line[0] == ';') continue;
         size_t eq = line.find('=');
@@ -55,12 +56,12 @@ GusekAiConfig::GusekAiConfig()
     : enabled(true), hotkey("T"),
       server_exe("ai/llama/llama-server.exe"),
       model("ai/models/Qwen3.5-4B-Q4_K_M.gguf"),
-      model_url("https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf"),
+      model_url("https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf"),
       model_sha256("00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"),
       model_bytes(2740937888ULL),
       vision(true),
       vision_model("ai/models/Qwen3.5-4B-mmproj-F16.gguf"),
-      vision_url("https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/mmproj-F16.gguf"),
+      vision_url("https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf"),
       vision_sha256("cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864"),
       vision_bytes(672423616ULL),
       image_max_tokens(256),
@@ -92,21 +93,22 @@ void GusekAiConfig::Load(const std::string &appDir) {
     app_home = appDir;
 
     // Determine data_dir (%GUSEK_AI_DATA% or %LOCALAPPDATA%\GusekAI)
-    char envData[MAX_PATH] = {0};
-    DWORD envLen = GetEnvironmentVariableA("GUSEK_AI_DATA", envData, sizeof(envData));
-    if (envLen > 0 && envLen < sizeof(envData)) {
-        data_dir = envData;
+    wchar_t envData[32768] = {0};
+    DWORD envLen = GetEnvironmentVariableW(L"GUSEK_AI_DATA", envData, 32768);
+    if (envLen > 0 && envLen < 32768) {
+        data_dir = WideToUtf8(envData);
     } else {
-        char localAppData[MAX_PATH] = {0};
-        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData))) {
-            data_dir = std::string(localAppData) + "\\GusekAI";
+        wchar_t localAppData[MAX_PATH] = {0};
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData))) {
+            data_dir = WideToUtf8(localAppData) + "\\GusekAI";
         } else {
             data_dir = app_home + "\\data";
         }
     }
-    CreateDirectoryA(data_dir.c_str(), NULL);
-    CreateDirectoryA((data_dir + "\\logs").c_str(), NULL);
-    CreateDirectoryA((data_dir + "\\models").c_str(), NULL);
+    SHCreateDirectoryExW(NULL, Utf8ToWide(data_dir).c_str(), NULL);
+    CreateDirectoryW(Utf8ToWide(data_dir + "\\logs").c_str(), NULL);
+    CreateDirectoryW(Utf8ToWide(data_dir + "\\models").c_str(), NULL);
+    CreateDirectoryW(Utf8ToWide(data_dir + "\\context").c_str(), NULL);
 
     std::map<std::string, std::string> kv;
 
@@ -175,43 +177,51 @@ void GusekAiConfig::Load(const std::string &appDir) {
     if (kv.count("context_max_chars")) context_max_chars = atoi(kv["context_max_chars"].c_str());
     if (kv.count("keep_history")) keep_history = atoi(kv["keep_history"].c_str());
 
+    // Keep inference on loopback and bound user-editable resource settings.
+    if (host != "127.0.0.1" && host != "localhost" && host != "::1") host = "127.0.0.1";
+    if (port < 1 || port > 65535) port = 28713;
+    startup_timeout = (std::max)(1, (std::min)(startup_timeout, 86400));
+    request_timeout = (std::max)(1, (std::min)(request_timeout, 86400));
+    ctx_size = (std::max)(512, (std::min)(ctx_size, 32768));
+    n_predict = (std::max)(1, (std::min)(n_predict, 8192));
+    threads = (std::max)(0, (std::min)(threads, 256));
+    gpu_layers = (std::max)(0, gpu_layers);
+    image_max_tokens = (std::max)(64, (std::min)(image_max_tokens, 1024));
+    temperature = (std::max)(0.0, (std::min)(temperature, 2.0));
+    top_p = (std::max)(0.0, (std::min)(top_p, 1.0));
+    context_max_chars = (std::max)(0, (std::min)(context_max_chars, 60000));
+    keep_history = (std::max)(0, (std::min)(keep_history, 100));
+    if (hotkey.size() != 1 || !isalnum(static_cast<unsigned char>(hotkey[0]))) hotkey = "T";
+    hotkey[0] = static_cast<char>(toupper(static_cast<unsigned char>(hotkey[0])));
+
     // Resolve paths
     resolved_server_exe = ResolvePath(server_exe);
     
-    // Check if model exists in data_dir, app_home, or peer cache
+    // Use an explicit model path or the assistant's own model folder.
     resolved_model = ResolvePath(model);
     if (!FileExists(resolved_model)) {
         std::string inData = data_dir + "\\models\\" + model.substr(model.find_last_of("/\\") + 1);
-        if (FileExists(inData)) resolved_model = inData;
-        else {
-            // Check D:\rgui-build\cache and D:\rstudio-build\cache
-            std::string fileName = model.substr(model.find_last_of("/\\") + 1);
-            if (FileExists("D:\\rgui-build\\cache\\" + fileName)) resolved_model = "D:\\rgui-build\\cache\\" + fileName;
-            else if (FileExists("D:\\rstudio-build\\cache\\" + fileName)) resolved_model = "D:\\rstudio-build\\cache\\" + fileName;
-            else resolved_model = inData; // target download destination
-        }
+        resolved_model = inData;
     }
 
     resolved_vision_model = ResolvePath(vision_model);
     if (!FileExists(resolved_vision_model)) {
         std::string inData = data_dir + "\\models\\" + vision_model.substr(vision_model.find_last_of("/\\") + 1);
-        if (FileExists(inData)) resolved_vision_model = inData;
-        else {
-            std::string fileName = vision_model.substr(vision_model.find_last_of("/\\") + 1);
-            if (FileExists("D:\\rgui-build\\cache\\" + fileName)) resolved_vision_model = "D:\\rgui-build\\cache\\" + fileName;
-            else if (FileExists("D:\\rstudio-build\\cache\\" + fileName)) resolved_vision_model = "D:\\rstudio-build\\cache\\" + fileName;
-            else resolved_vision_model = inData;
-        }
+        resolved_vision_model = inData;
     }
 
     resolved_prompt_file = ResolvePath(system_prompt_file);
+    if (FileExists(data_dir + "\\system_prompt.txt"))
+        resolved_prompt_file = data_dir + "\\system_prompt.txt";
     resolved_context_dir = ResolvePath(context_dir);
     resolved_log_file = data_dir + "\\logs\\llama-server.log";
 }
 
 std::string GusekAiConfig::GetSystemPrompt() const {
-    if (FileExists(resolved_prompt_file)) {
-        std::ifstream in(resolved_prompt_file.c_str(), std::ios::binary);
+    std::string promptPath = data_dir + "\\system_prompt.txt";
+    if (!FileExists(promptPath)) promptPath = resolved_prompt_file;
+    if (FileExists(promptPath)) {
+        std::ifstream in(Utf8ToWide(promptPath).c_str(), std::ios::binary);
         if (in.is_open()) {
             std::stringstream buffer;
             buffer << in.rdbuf();
@@ -221,7 +231,7 @@ std::string GusekAiConfig::GetSystemPrompt() const {
     // Check shipped fallback in ai/defaults/system_prompt.txt
     std::string defPrompt = ResolvePath("ai/defaults/system_prompt.txt");
     if (FileExists(defPrompt)) {
-        std::ifstream in(defPrompt.c_str(), std::ios::binary);
+        std::ifstream in(Utf8ToWide(defPrompt).c_str(), std::ios::binary);
         if (in.is_open()) {
             std::stringstream buffer;
             buffer << in.rdbuf();
@@ -261,7 +271,6 @@ std::string GusekAiConfig::GetCourseContext(const std::string &question, const s
     if (!activeDocDir.empty()) {
         std::string localCtx = activeDocDir + "\\.ai-context";
         if (DirExists(localCtx)) dirsToScan.push_back(localCtx);
-        if (DirExists(activeDocDir)) dirsToScan.push_back(activeDocDir);
     }
     if (DirExists(resolved_context_dir)) {
         dirsToScan.push_back(resolved_context_dir);
@@ -293,14 +302,15 @@ std::string GusekAiConfig::GetCourseContext(const std::string &question, const s
 
     for (size_t d = 0; d < dirsToScan.size(); d++) {
         std::string pattern = dirsToScan[d] + "\\*.*";
-        WIN32_FIND_DATAA fd;
-        HANDLE hFind = FindFirstFileA(pattern.c_str(), &fd);
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(Utf8ToWide(pattern).c_str(), &fd);
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
-                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                    std::string fname = fd.cFileName;
+                if (!(fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+                    fd.nFileSizeHigh == 0 && fd.nFileSizeLow <= 262144 && candidates.size() < 64) {
+                    std::string fname = WideToUtf8(fd.cFileName);
                     std::string lowerName = ToLower(fname);
-                    if (lowerName == "readme.txt" || lowerName == "readme.md") continue;
+                    if (lowerName == "readme" || lowerName == "readme.txt" || lowerName == "readme.md") continue;
 
                     // Match extension
                     size_t dot = lowerName.find_last_of('.');
@@ -311,11 +321,11 @@ std::string GusekAiConfig::GetCourseContext(const std::string &question, const s
                             std::string fullPath = dirsToScan[d] + "\\" + fname;
                             if (seenPaths.count(fullPath) == 0) {
                                 seenPaths.insert(fullPath);
-                                std::ifstream in(fullPath.c_str(), std::ios::binary);
+                                std::ifstream in(Utf8ToWide(fullPath).c_str(), std::ios::binary);
                                 if (in.is_open()) {
-                                    std::stringstream sb;
-                                    sb << in.rdbuf();
-                                    std::string content = sb.str();
+                                    std::string content(262144, '\0');
+                                    in.read(&content[0], content.size());
+                                    content.resize(static_cast<size_t>(in.gcount()));
                                     int score = 0;
                                     std::string lowerContent = ToLower(content);
                                     for (std::set<std::string>::iterator it = searchWords.begin(); it != searchWords.end(); ++it) {
@@ -336,7 +346,7 @@ std::string GusekAiConfig::GetCourseContext(const std::string &question, const s
                         }
                     }
                 }
-            } while (FindNextFileA(hFind, &fd));
+            } while (FindNextFileW(hFind, &fd));
             FindClose(hFind);
         }
     }
@@ -346,18 +356,24 @@ std::string GusekAiConfig::GetCourseContext(const std::string &question, const s
     std::sort(candidates.begin(), candidates.end(), CompareScored);
 
     std::string result = "\n\nCOURSE REFERENCE MATERIAL\n\n";
-    int charsLeft = context_max_chars;
+    int charsLeft = context_max_chars - static_cast<int>(result.size());
+    if (charsLeft <= 200) return "";
 
     for (size_t i = 0; i < candidates.size() && charsLeft > 200; i++) {
         std::string header = "--- Excerpt from: " + candidates[i].filename + " ---\n";
+        if (static_cast<int>(header.size()) + 40 >= charsLeft) break;
         result += header;
         charsLeft -= (int)header.length();
 
-        if ((int)candidates[i].content.length() <= charsLeft) {
+        if ((int)candidates[i].content.length() + 2 <= charsLeft) {
             result += candidates[i].content + "\n\n";
             charsLeft -= (int)candidates[i].content.length() + 2;
         } else {
-            result += candidates[i].content.substr(0, (size_t)charsLeft) + "\n[...remainder omitted for length...]\n\n";
+            const std::string omission = "\n[...remainder omitted for length...]\n\n";
+            size_t cut = static_cast<size_t>((std::max)(0, charsLeft - static_cast<int>(omission.size())));
+            while (cut > 0 && cut < candidates[i].content.size() &&
+                   (static_cast<unsigned char>(candidates[i].content[cut]) & 0xc0) == 0x80) --cut;
+            result += candidates[i].content.substr(0, cut) + omission;
             charsLeft = 0;
             break;
         }

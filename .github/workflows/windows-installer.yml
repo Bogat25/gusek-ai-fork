@@ -1,4 +1,6 @@
-name: Windows installer
+# A pushed version tag builds/tests, then publishes downloadable release assets.
+# Manual dispatch builds/tests only; publishing is limited to tag push events.
+name: Windows installer release
 
 on:
   push:
@@ -18,86 +20,144 @@ env:
   BUILD_ROOT: C:\gusek-build
 
 jobs:
-  installer:
+  build:
     runs-on: windows-2025
     timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     defaults:
       run:
         shell: pwsh
-
     steps:
-      - name: Check out the tagged source
+      - name: Check out the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Validate the version tag
+      - name: Validate the version
         id: version
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          if ($env:REF_TYPE -eq 'tag') {
-            if ($env:REF_NAME -notmatch '^v?(\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?)$') {
-              throw "Tag '$($env:REF_NAME)' is not like v1.76.0 or 1.76.0-rc1"
-            }
-            $v = $Matches[1]
-          } else {
-            $v = "1.76.0-dev.$($env:RUN_NUMBER)"
-          }
-          "version=$v" >> $env:GITHUB_OUTPUT
-          Write-Host "Resolved version: $v"
+        run: .\scripts\release-version.ps1 -RefType $env:REF_TYPE -RefName $env:REF_NAME -RunNumber $env:RUN_NUMBER
 
-      - name: Cache downloads
+      - name: Cache pinned downloads and compiler
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ env.BUILD_ROOT }}\cache
             ${{ env.BUILD_ROOT }}\tools\innosetup
-          key: gusek-downloads-${{ hashFiles('gusek.ps1') }}
-          restore-keys: gusek-downloads-
+          key: gusek-tools-${{ hashFiles('gusek.ps1') }}
+          restore-keys: gusek-tools-
 
-      - name: Fetch pinned llama.cpp
+      - name: Fetch pinned llama.cpp and per-user Inno Setup
         run: .\gusek.cmd fetch -NoModel -BuildRoot $env:BUILD_ROOT
 
       - name: Build GUSEK and Scintilla
         run: .\gusek.cmd full -BuildRoot $env:BUILD_ROOT
 
-      - name: Run unit and protocol tests
+      - name: Run native, wrapper and actual GUI regressions
         run: .\gusek.cmd test -BuildRoot $env:BUILD_ROOT
 
-      - name: Build portable distribution
+      - name: Build portable package and non-admin installer
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: .\gusek.cmd package -Version $env:VERSION -BuildRoot $env:BUILD_ROOT
+        run: |
+          .\gusek.cmd package -Version $env:VERSION -BuildRoot $env:BUILD_ROOT
+          if ($LASTEXITCODE -ne 0) { throw 'Portable packaging failed.' }
+          .\gusek.cmd installer -Version $env:VERSION -BuildRoot $env:BUILD_ROOT
+          if ($LASTEXITCODE -ne 0) { throw 'Installer packaging failed.' }
 
-      - name: Build Inno Setup installer
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: .\gusek.cmd installer -Version $env:VERSION -BuildRoot $env:BUILD_ROOT
-
-      - name: Verify installer (install, launch, upgrade preservation, uninstall)
+      - name: Verify per-user install, GUI, upgrade and uninstall
         run: .\gusek.cmd test -Installer -BuildRoot $env:BUILD_ROOT
 
-      - name: Upload installer and portable package artifacts
+      - name: Write release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          $installer = "gusek-ai-$env:VERSION-setup.exe"
+          $portable = "gusek-$env:VERSION-portable.zip"
+          $checksum = (Get-FileHash -LiteralPath "$env:BUILD_ROOT\dist\$installer" -Algorithm SHA256).Hash.ToLowerInvariant()
+          @"
+          GUSEK with a local MathProg / GLPK assistant. Open **Tools > AI assistant**
+          or press **Ctrl+Shift+T**.
+
+          Download **$installer** for Windows 11 x64 (also supports Windows 10 1903+).
+          Installation is for the current user and does not request administrator
+          permissions. The default folder is LocalAppData\Programs\GUSEK AI.
+          **$portable** runs from an extracted folder or USB drive using Start-Gusek.cmd.
+
+          The packages contain the CPU runtime and exclude the large models.
+          First use offers the verified Qwen3.5-4B model and picture reader download
+          (about 3.4 GB). Subsequent use works offline. Course notes and prompts stay local;
+          generated code is inserted only when requested and is never executed automatically.
+
+          This build is unsigned. Windows reputation checks may still display a warning;
+          that is separate from administrator elevation.
+
+          SHA-256 ($installer): $checksum
+          Built from $env:COMMIT. Source is available in this tag's source archive.
+          "@ | Set-Content -LiteralPath "$env:BUILD_ROOT\dist\release-notes.md" -Encoding utf8
+
+      - name: Upload tested release files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: GUSEK-AI-${{ steps.version.outputs.version }}-windows-x86
+          name: gusek-windows-release
           path: |
             ${{ env.BUILD_ROOT }}\dist\gusek-ai-*-setup.exe
             ${{ env.BUILD_ROOT }}\dist\gusek-ai-*-setup.exe.sha256
             ${{ env.BUILD_ROOT }}\dist\gusek-*-portable.zip
             ${{ env.BUILD_ROOT }}\dist\gusek-*-portable.zip.sha256
+            ${{ env.BUILD_ROOT }}\dist\release-notes.md
           compression-level: 0
           if-no-files-found: error
           retention-days: 90
 
-      - name: Upload build logs on failure
+      - name: Upload diagnostic logs on failure
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gusek-build-logs-${{ github.run_id }}
-          path: ${{ env.BUILD_ROOT }}\logs\*.log
+          name: gusek-logs-${{ github.run_id }}
+          path: |
+            ${{ env.BUILD_ROOT }}\logs
+            ${{ env.BUILD_ROOT }}\tests\run-*/**/*.log
+            ${{ env.BUILD_ROOT }}\tests\run-*/**/status.txt
           if-no-files-found: ignore
           retention-days: 14
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gusek-windows-release
+          path: dist
+
+      - name: Verify checksums and publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sed -i 's/\r$//' -- *.sha256
+          sha256sum --check --strict -- *.sha256
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease --latest=false); fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "GUSEK AI $VERSION" --notes-file release-notes.md \
+            "${flags[@]}" "gusek-ai-$VERSION-setup.exe" "gusek-ai-$VERSION-setup.exe.sha256" \
+            "gusek-$VERSION-portable.zip" "gusek-$VERSION-portable.zip.sha256"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false "${flags[@]}"

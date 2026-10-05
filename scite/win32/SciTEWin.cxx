@@ -166,6 +166,8 @@ SciTEWin::SciTEWin(Extension *ext) : SciTEBase(ext) {
 	widthAiPane = 380;
 	widthAiPaneStartDrag = 380;
 	aiVisible = false;
+	aiEnabled = true;
+	aiHotkey = 'T';
 	capturedAiMouse = false;
 	lastSolverExitCode = 0;
 
@@ -274,6 +276,7 @@ void SciTEWin::ReadProperties() {
 
 	win95DeathDelay = static_cast<unsigned int>(props.GetInt("win95.death.delay", 500));
 	outputScroll = props.GetInt("output.scroll", 1);
+	ConfigureAiAssistant();
 	if (!firstPropertiesRead) {
 		aiVisible = props.GetInt("ai.visible", 0) != 0;
 		int w = props.GetInt("ai.width", 0);
@@ -782,6 +785,8 @@ DWORD SciTEWin::ExecuteOne(const Job &jobToRun, bool &seenOutput) {
 					if (isSolverJob) {
 						Lock lock(jobQueue.mutex);
 						lastSolverOutput.append(buffer, bytesRead);
+                        if (lastSolverOutput.size() > 262144)
+                            lastSolverOutput.erase(0, lastSolverOutput.size() - 262144);
 					}
 
 					if (jobToRun.flags & jobRepSelMask) {
@@ -2148,7 +2153,45 @@ int SciTEWin::NormaliseSplit(int splitPos) {
 	return splitPos;
 }
 
+void SciTEWin::ConfigureAiAssistant() {
+    wchar_t executable[32768];
+    if (!GetModuleFileNameW(NULL, executable, 32768)) return;
+    std::string directory = WideToUtf8(executable);
+    directory = directory.substr(0, directory.find_last_of("/\\"));
+    GusekAiConfig config;
+    config.Load(directory);
+    aiEnabled = config.enabled && props.GetInt("ai.enabled", 1) != 0;
+    aiHotkey = config.hotkey[0];
+    SString propertyKey = props.Get("ai.hotkey");
+    if (propertyKey.length() == 1 && isalnum(static_cast<unsigned char>(propertyKey[0])))
+        aiHotkey = toupper(static_cast<unsigned char>(propertyKey[0]));
+    if (!wContent.GetID()) return;
+    if (!aiEnabled) {
+        delete aiPane;
+        aiPane = 0;
+        aiVisible = false;
+        DestroyMenuItem(menuTools, IDM_AIASSISTANT);
+    } else {
+        if (!aiPane) {
+            aiPane = new GusekAiPane(this);
+            if (!aiPane->Create(reinterpret_cast<HWND>(wContent.GetID()), 0, 0, widthAiPane, 100)) {
+                delete aiPane;
+                aiPane = 0;
+                aiVisible = false;
+                aiEnabled = false;
+                return;
+            }
+        }
+        char shortcut[] = "Ctrl+Shift+T";
+        shortcut[11] = static_cast<char>(aiHotkey);
+        SetMenuItem(menuTools, IDM_AIASSISTANT, IDM_AIASSISTANT, "&AI assistant", shortcut);
+    }
+    SizeContentWindows();
+    RedrawMenu();
+}
+
 void SciTEWin::ToggleAiAssistant() {
+	if (!aiEnabled || !aiPane) return;
 	SetAssistantVisible(!aiVisible);
 	if (aiVisible && aiPane) {
 		aiPane->Show(true);
@@ -2271,6 +2314,7 @@ std::string SciTEWin::GetProperty(const char *key) {
 }
 
 void SciTEWin::SetAssistantVisible(bool visible) {
+	if (!aiEnabled || !aiPane) visible = false;
 	if (aiVisible != visible) {
 		aiVisible = visible;
 		SizeContentWindows();
@@ -2290,11 +2334,29 @@ int SciTEWin::EventLoop() {
 		going = isWindowsNT ? ::GetMessageW(&msg, NULL, 0, 0) : ::GetMessageA(&msg, NULL, 0, 0);
 		if (going) {
 			if (!ModelessHandler(&msg)) {
+                if (aiEnabled && msg.message == WM_KEYDOWN && msg.wParam == static_cast<WPARAM>(aiHotkey) &&
+                    GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_SHIFT) < 0) {
+                    ToggleAiAssistant();
+                    continue;
+                }
 				if (aiPane && aiVisible) {
 					HWND hFocus = ::GetFocus();
 					if (hFocus && (hFocus == aiPane->GetHWND() || ::IsChild(aiPane->GetHWND(), hFocus))) {
 						if (msg.message == WM_KEYDOWN) {
-							if (msg.wParam == VK_RETURN && (GetKeyState(VK_CONTROL) < 0) && !(GetKeyState(VK_SHIFT) < 0)) {
+							if (msg.wParam == VK_TAB && !(GetKeyState(VK_CONTROL) < 0) && !(GetKeyState(VK_MENU) < 0)) {
+								HWND next = GetNextDlgTabItem(aiPane->GetHWND(), hFocus, GetKeyState(VK_SHIFT) < 0);
+								if (next) SetFocus(next);
+								continue;
+								}
+								if (msg.wParam == VK_RETURN && !(GetKeyState(VK_CONTROL) < 0) && !(GetKeyState(VK_MENU) < 0)) {
+								wchar_t controlClass[32];
+								GetClassNameW(hFocus, controlClass, 32);
+								if (wcscmp(controlClass, L"Button") == 0) {
+									SendMessage(hFocus, BM_CLICK, 0, 0);
+									continue;
+								}
+								}
+							if (hFocus == aiPane->GetQuestionHWND() && msg.wParam == VK_RETURN && (GetKeyState(VK_CONTROL) < 0) && !(GetKeyState(VK_SHIFT) < 0)) {
 								aiPane->SendQuestion();
 								continue;
 							}

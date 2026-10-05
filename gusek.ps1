@@ -72,19 +72,32 @@ $LlamaUrl    = "https://github.com/ggml-org/llama.cpp/releases/download/b11153/$
 $LlamaSha256 = '569d19826f3fb00a3fc2df7bd68ab9ad33e5c0d6d69ce022b24372700cee7931'
 
 $ModelFile   = 'Qwen3.5-4B-Q4_K_M.gguf'
-$ModelUrl    = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/$ModelFile"
+$ModelUrl    = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/$ModelFile"
 $ModelSha256 = '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4'
 $ModelSize   = 2740937888
 
 $VisionFile   = 'Qwen3.5-4B-mmproj-F16.gguf'
-$VisionUrl    = 'https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/mmproj-F16.gguf'
+$VisionUrl    = 'https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf'
 $VisionSha256 = 'cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864'
 $VisionSize   = 672423616
+
+$InnoFile = 'innosetup-7.1.0-x64.exe'
+$InnoUrl = "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/$InnoFile"
+$InnoSha256 = '0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f'
 
 # ---------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------
 $Repo    = $PSScriptRoot
+if ($BuildRoot -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)') { throw 'BuildRoot must be absolute.' }
+$BuildRoot = [IO.Path]::GetFullPath($BuildRoot).TrimEnd('\')
+$repoPath = [IO.Path]::GetFullPath($Repo).TrimEnd('\')
+if ($BuildRoot -eq [IO.Path]::GetPathRoot($BuildRoot).TrimEnd('\') -or
+    $BuildRoot -eq $repoPath -or
+    $BuildRoot.StartsWith($repoPath + '\', [StringComparison]::OrdinalIgnoreCase) -or
+    $repoPath.StartsWith($BuildRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'BuildRoot must be separate from the source repository and cannot be a drive root.'
+}
 $Tree    = Join-Path $BuildRoot 'tree'
 $Cache   = Join-Path $BuildRoot 'cache'
 $Logs    = Join-Path $BuildRoot 'logs'
@@ -289,6 +302,32 @@ function Do-Doctor {
     }
 }
 
+function Install-InnoSetup {
+    $compiler = Join-Path $BuildRoot 'tools\innosetup\ISCC.exe'
+    if (Test-Path -LiteralPath $compiler) {
+        if ((& $compiler --version 2>$null | Out-String).Trim() -ne '7.1.0') {
+            Stop-WithError 'Cached compiler is not Inno Setup 7.1.0; select a fresh BuildRoot.'
+        }
+        return $compiler
+    }
+    $existing = Find-InnoSetup
+    if ($existing -and ((& $existing --version 2>$null | Out-String).Trim() -eq '7.1.0')) {
+        $target = Split-Path $compiler -Parent
+        New-Item -ItemType Directory -Force -Path $target | Out-Null
+        Copy-Item -Path (Join-Path (Split-Path $existing -Parent) '*') -Destination $target -Recurse -Force
+        return $compiler
+    }
+    $setup = Ensure-CacheFile $InnoFile $InnoUrl $InnoSha256 0
+    $toolDirectory = Split-Path $compiler -Parent
+    $process = Start-Process -FilePath $setup -ArgumentList @(
+        '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/NOICONS',"/DIR=""$toolDirectory"""
+    ) -WindowStyle Hidden -Wait -PassThru
+    if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $compiler)) {
+        Stop-WithError 'Could not install the pinned Inno Setup compiler for the current user.'
+    }
+    return $compiler
+}
+
 function Do-Fetch {
     Say "Fetching pinned assets into $Cache"
     Ensure-CacheFile $LlamaZip $LlamaUrl $LlamaSha256 0 | Out-Null
@@ -298,12 +337,25 @@ function Do-Fetch {
     } else {
         Note "Skipping model downloads (-NoModel)"
     }
+    $null = Install-InnoSetup
     Say "Fetch complete."
 }
 
 function Do-FullBuild {
     Say "Full build: Scintilla and GUSEK"
     Initialize-VcVars
+    $modeStamp = Join-Path $Logs 'build-mode.txt'
+    $releaseMode = 'msvc-x86-release-v1'
+    if (-not (Test-Path -LiteralPath $modeStamp) -or
+        (Get-Content -LiteralPath $modeStamp -Raw).Trim() -ne $releaseMode) {
+        # A previous caller may have inherited DEBUG through nmake's environment.
+        # Rebuild the owned mirror before switching its compiler/runtime mode.
+        $resolvedTree = [IO.Path]::GetFullPath($Tree)
+        if (-not $resolvedTree.StartsWith($BuildRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            Stop-WithError 'Refusing to rebuild a tree outside BuildRoot.'
+        }
+        if (Test-Path -LiteralPath $resolvedTree) { Remove-Item -LiteralPath $resolvedTree -Recurse -Force }
+    }
     Sync-Tree
 
     New-Item -ItemType Directory -Force -Path $Logs | Out-Null
@@ -316,7 +368,7 @@ function Do-FullBuild {
     $scintillaDir = Join-Path $Tree 'scintilla\win32'
     Push-Location $scintillaDir
     try {
-        cmd /d /c "call `"$script:VcVarsPath`" x86 >nul 2>&1 && nmake -f scintilla.mak > `"$log`" 2>&1"
+        cmd /d /c "call `"$script:VcVarsPath`" x86 >nul 2>&1 && set `"DEBUG=`" && nmake -f scintilla.mak > `"$log`" 2>&1"
         if ($LASTEXITCODE -ne 0) { Stop-WithError "Scintilla build failed" }
     } finally { Pop-Location }
 
@@ -324,7 +376,7 @@ function Do-FullBuild {
     $sciteDir = Join-Path $Tree 'scite\win32'
     Push-Location $sciteDir
     try {
-        cmd /d /c "call `"$script:VcVarsPath`" x86 >nul 2>&1 && nmake -f scite.mak ..\bin\Sc1.exe >> `"$log`" 2>&1"
+        cmd /d /c "call `"$script:VcVarsPath`" x86 >nul 2>&1 && set `"DEBUG=`" && nmake -f scite.mak ..\bin\Sc1.exe >> `"$log`" 2>&1"
         if ($LASTEXITCODE -ne 0) { Stop-WithError "GUSEK (Sc1.exe) build failed" }
     } finally { Pop-Location }
 
@@ -338,12 +390,18 @@ function Do-FullBuild {
     # Copy runtime dependencies and assets from repo
     foreach ($item in @('glpsol.exe', 'glpk_4_65.dll', 'SciTEGlobal.properties', 'gmpl.properties',
                         'gnuplot.properties', 'python.properties', 'gusek.lua', 'gmpl.api', 'gmpl.abb',
-                        'README', 'gusek.html', 'gmpl.pdf', 'glpk.pdf', 'examples', 'gusek_tips', 'Start-Gusek.cmd')) {
+                        'README', 'COPYING', 'AI-README.md', 'THIRD-PARTY.md', 'gusek.html', 'gmpl.pdf', 'glpk.pdf', 'examples', 'gusek_tips', 'Start-Gusek.cmd')) {
         $src = Join-Path $Repo $item
         if (Test-Path $src) {
             Copy-Item $src $Stage -Recurse -Force
         }
     }
+
+    $licenseDir = Join-Path $Stage 'licenses'
+    New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $Repo 'scintilla\License.txt') -Destination (Join-Path $licenseDir 'scintilla-LICENSE.txt') -Force
+    Copy-Item -LiteralPath (Join-Path $Repo 'scite\License.txt') -Destination (Join-Path $licenseDir 'scite-LICENSE.txt') -Force
+    Copy-Item -LiteralPath (Join-Path $Repo 'packaging\licenses\llama.cpp-LICENSE.txt') -Destination $licenseDir -Force
 
     # Stage llama-server
     $llamaZipPath = Join-Path $Cache $LlamaZip
@@ -366,10 +424,17 @@ function Do-FullBuild {
     }
 
     $sw.Stop()
+    Set-Content -LiteralPath $modeStamp -Value $releaseMode -Encoding ASCII
     Say ("Full build succeeded in {0:0.0}s. Output staged at $Stage" -f $sw.Elapsed.TotalSeconds)
 }
 
 function Do-QuickBuild {
+    $modeStamp = Join-Path $Logs 'build-mode.txt'
+    if (-not (Test-Path -LiteralPath $modeStamp) -or
+        (Get-Content -LiteralPath $modeStamp -Raw).Trim() -ne 'msvc-x86-release-v1') {
+        Do-FullBuild
+        return
+    }
     Say "Quick build: GUSEK"
     Initialize-VcVars
     Sync-Tree
@@ -382,7 +447,7 @@ function Do-QuickBuild {
     $sciteDir = Join-Path $Tree 'scite\win32'
     Push-Location $sciteDir
     try {
-        cmd /d /c "call `"$script:VcVarsPath`" x86 >nul 2>&1 && nmake -f scite.mak ..\bin\Sc1.exe > `"$log`" 2>&1"
+        cmd /d /c "call `"$script:VcVarsPath`" x86 >nul 2>&1 && set `"DEBUG=`" && nmake -f scite.mak ..\bin\Sc1.exe > `"$log`" 2>&1"
         if ($LASTEXITCODE -ne 0) { Stop-WithError "GUSEK build failed" }
     } finally { Pop-Location }
 
@@ -399,14 +464,33 @@ function Do-Run {
         Do-FullBuild
     }
     Say "Starting GUSEK from $Stage..."
-    Start-Process -FilePath $exe -WorkingDirectory $Stage
+    $devProfile = Join-Path $BuildRoot 'profile'
+    New-Item -ItemType Directory -Force -Path $devProfile | Out-Null
+    $devConfig = Join-Path $devProfile 'GusekAI.ini'
+    if (-not (Test-Path -LiteralPath $devConfig)) {
+        $settings = @()
+        if (Test-Path -LiteralPath (Join-Path $Cache $ModelFile)) { $settings += "model=$(Join-Path $Cache $ModelFile)" }
+        if (Test-Path -LiteralPath (Join-Path $Cache $VisionFile)) { $settings += "vision_model=$(Join-Path $Cache $VisionFile)" }
+        $settings | Set-Content -LiteralPath $devConfig -Encoding UTF8
+    }
+    $savedData = $env:GUSEK_AI_DATA
+    try {
+        $env:GUSEK_AI_DATA = $devProfile
+        Start-Process -FilePath $exe -WorkingDirectory $Stage
+    } finally { $env:GUSEK_AI_DATA = $savedData }
 }
 
 function Do-Clean {
     Say "Cleaning build tree at $BuildRoot"
-    if (Test-Path $Tree)  { Remove-Item $Tree -Recurse -Force }
-    if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
-    if (Test-Path $Dist)  { Remove-Item $Dist -Recurse -Force }
+    foreach ($target in @($Tree,$Stage,$Dist)) {
+        $resolved = [IO.Path]::GetFullPath($target)
+        if (-not $resolved.StartsWith($BuildRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            Stop-WithError 'Refusing to clean a path outside BuildRoot.'
+        }
+    }
+    if (Test-Path $Tree)  { Remove-Item -LiteralPath $Tree -Recurse -Force }
+    if (Test-Path $Stage) { Remove-Item -LiteralPath $Stage -Recurse -Force }
+    if (Test-Path $Dist)  { Remove-Item -LiteralPath $Dist -Recurse -Force }
     Note "Clean completed."
 }
 
@@ -428,7 +512,7 @@ function Get-NumericVersion([string]$Value) {
 function Do-Installer {
     $numericVersion = Get-NumericVersion $Version
     Do-FullBuild
-    $iscc = Find-InnoSetup
+    $iscc = if ($InnoSetup) { Find-InnoSetup } else { Install-InnoSetup }
     if (-not $iscc) {
         Stop-WithError "Inno Setup compiler (ISCC.exe) not found. Pass -InnoSetup <path>."
     }

@@ -175,6 +175,17 @@ public:
             WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX) != FALSE;
     }
 
+    bool Header(DWORD field, std::wstring &value) {
+        DWORD size = 0;
+        WinHttpQueryHeaders(request, field, WINHTTP_HEADER_NAME_BY_INDEX, NULL, &size, WINHTTP_NO_HEADER_INDEX);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size > 16384) return false;
+        std::vector<wchar_t> buffer(size / sizeof(wchar_t) + 1, 0);
+        if (!WinHttpQueryHeaders(request, field, WINHTTP_HEADER_NAME_BY_INDEX, &buffer[0], &size,
+                                 WINHTTP_NO_HEADER_INDEX)) return false;
+        value = &buffer[0];
+        return true;
+    }
+
     bool Read(void *buffer, DWORD capacity, DWORD &size) {
         size = 0;
         if (IsCancelled()) { error = ERROR_CANCELLED; return false; }

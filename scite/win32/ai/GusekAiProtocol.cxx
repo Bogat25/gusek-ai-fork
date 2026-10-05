@@ -10,6 +10,7 @@ static bool HexVal(char c, unsigned int &v) {
 }
 
 static void AppendUtf8(std::string &out, unsigned int cp) {
+    if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;
     if (cp <= 0x7F) {
         out += (char)cp;
     } else if (cp <= 0x7FF) {
@@ -114,79 +115,71 @@ std::string GusekAiProtocol::BuildChatRequestJson(
     const std::vector<std::string> &currentImages,
     const GusekAiConfig &config)
 {
-    std::string json = "{\"messages\":[";
-
-    // 1. System Prompt
-    json += "{\"role\":\"system\",\"content\":\"" + EscapeJsonString(systemPromptWithContext) + "\"}";
-
-    // 2. History: keep up to config.keep_history messages
-    size_t histStart = 0;
-    if (history.size() > (size_t)config.keep_history) {
-        histStart = history.size() - config.keep_history;
+    const std::string oldPicture = "[A picture was attached here; it is no longer shown.]";
+    size_t limit = static_cast<size_t>((std::max)(0, config.keep_history));
+    size_t histStart = history.size() > limit ? history.size() - limit : 0;
+    size_t currentStart = currentImages.size() > 4 ? currentImages.size() - 4 : 0;
+    size_t remaining = 4 - (currentImages.size() - currentStart);
+    std::vector<size_t> imageStart(history.size(), 0);
+    // Allocate the picture budget backwards so newer turns win.
+    for (size_t i = history.size(); i > histStart; ) {
+        --i;
+        size_t count = history[i].role == "user" ? history[i].imageDataUrls.size() : 0;
+        size_t keep = (std::min)(count, remaining);
+        imageStart[i] = count - keep;
+        remaining -= keep;
     }
 
-    // Rule: at most 4 newest images total across entire request
-    // Calculate how many images in current turn vs history
-    int imagesAllowedInHistory = 4 - (int)currentImages.size();
-    if (imagesAllowedInHistory < 0) imagesAllowedInHistory = 0;
-
-    int historyImagesIncluded = 0;
-    for (size_t i = histStart; i < history.size(); i++) {
-        json += ",{\"role\":\"" + history[i].role + "\",";
-        if (history[i].imageDataUrls.empty() || history[i].role != "user") {
-            json += "\"content\":\"" + EscapeJsonString(history[i].content) + "\"}";
-        } else {
-            // Multimodal history turn
-            json += "\"content\":[";
-            bool addedItem = false;
-            if (historyImagesIncluded < imagesAllowedInHistory && !history[i].imageDataUrls.empty()) {
-                for (size_t img = 0; img < history[i].imageDataUrls.size() && historyImagesIncluded < imagesAllowedInHistory; img++) {
-                    if (addedItem) json += ",";
-                    json += "{\"type\":\"image_url\",\"image_url\":{\"url\":\"" +
-                            EscapeJsonString(history[i].imageDataUrls[img]) + "\"}}";
-                    historyImagesIncluded++;
-                    addedItem = true;
-                }
-            } else if (!history[i].imageDataUrls.empty()) {
-                // Picture was dropped due to limit
-                if (addedItem) json += ",";
-                json += "{\"type\":\"text\",\"text\":\"[A picture was attached here; it is no longer shown.]\"}";
-                addedItem = true;
-            }
-            if (!history[i].content.empty()) {
-                if (addedItem) json += ",";
-                json += "{\"type\":\"text\",\"text\":\"" + EscapeJsonString(history[i].content) + "\"}";
-            }
-            json += "]}";
+    std::string json = "{\"messages\":[{\"role\":\"system\",\"content\":\"" +
+        EscapeJsonString(systemPromptWithContext) + "\"}";
+    for (size_t i = histStart; i < history.size(); ++i) {
+        const ChatMessage &message = history[i];
+        json += ",{\"role\":\"" + EscapeJsonString(message.role) + "\",\"content\":";
+        if (message.role != "user" || message.imageDataUrls.empty()) {
+            json += "\"" + EscapeJsonString(message.content) + "\"}";
+            continue;
         }
-    }
-
-    // 3. Current User Turn
-    json += ",{\"role\":\"user\",";
-    if (currentImages.empty()) {
-        json += "\"content\":\"" + EscapeJsonString(userQuestion) + "\"}";
-    } else {
-        json += "\"content\":[";
-        for (size_t img = 0; img < currentImages.size() && img < 4; img++) {
-            if (img > 0) json += ",";
+        if (imageStart[i] == message.imageDataUrls.size()) {
+            std::string content = oldPicture + "\n" + message.content;
+            json += "\"" + EscapeJsonString(content) + "\"}";
+            continue;
+        }
+        json += "[";
+        bool comma = false;
+        for (size_t j = imageStart[i]; j < message.imageDataUrls.size(); ++j) {
+            if (comma) json += ",";
             json += "{\"type\":\"image_url\",\"image_url\":{\"url\":\"" +
-                    EscapeJsonString(currentImages[img]) + "\"}}";
+                EscapeJsonString(message.imageDataUrls[j]) + "\"}}";
+            comma = true;
         }
-        std::string qText = userQuestion;
-        if (qText.empty()) {
-            qText = "What does this picture show? If it is a model, optimization output, or an error, explain it.";
-        }
-        json += ",{\"type\":\"text\",\"text\":\"" + EscapeJsonString(qText) + "\"}]}";
+        std::string content = message.content;
+        if (imageStart[i] && content.find(oldPicture) == std::string::npos)
+            content = oldPicture + "\n" + content;
+        if (comma) json += ",";
+        json += "{\"type\":\"text\",\"text\":\"" + EscapeJsonString(content) + "\"}]}";
     }
 
-    // Close messages array and add generation parameters
+    json += ",{\"role\":\"user\",\"content\":";
+    if (currentImages.empty()) {
+        json += "\"" + EscapeJsonString(userQuestion) + "\"}";
+    } else {
+        json += "[";
+        for (size_t i = currentStart; i < currentImages.size(); ++i) {
+            if (i != currentStart) json += ",";
+            json += "{\"type\":\"image_url\",\"image_url\":{\"url\":\"" +
+                EscapeJsonString(currentImages[i]) + "\"}}";
+        }
+        std::string question = userQuestion.empty() ?
+            "What does this picture show? If it is a model, optimization output, or an error, explain it." :
+            userQuestion;
+        if (currentStart) question = oldPicture + "\n" + question;
+        json += ",{\"type\":\"text\",\"text\":\"" + EscapeJsonString(question) + "\"}]}";
+    }
     json += "],\"temperature\":" + std::to_string(config.temperature);
     json += ",\"top_p\":" + std::to_string(config.top_p);
     json += ",\"max_tokens\":" + std::to_string(config.n_predict);
-    json += ",\"stream\":true";
-    json += ",\"chat_template_kwargs\":{\"enable_thinking\":false}";
-    json += "}";
-
+    json += ",\"stream\":true,\"chat_template_kwargs\":{\"enable_thinking\":";
+    json += config.thinking ? "true}}" : "false}}";
     return json;
 }
 
@@ -251,13 +244,15 @@ bool GusekAiProtocol::ParseSseDelta(const char *sseLine, std::string &outText, b
     }
 
     // Look for "content": in payload
-    const char *contentKey = strstr(payload, "\"content\":");
+    const char *contentKey = strstr(payload, "\"content\"");
     if (!contentKey) {
         // Valid SSE line without content (e.g. role-only delta or metadata)
         return true;
     }
 
-    const char *valStart = contentKey + 10;
+    const char *valStart = contentKey + 9;
+    while (*valStart == ' ' || *valStart == '\t') ++valStart;
+    if (*valStart++ != ':') return false;
     while (*valStart == ' ' || *valStart == '\t') valStart++;
 
     if (*valStart == 'n' && strncmp(valStart, "null", 4) == 0) {

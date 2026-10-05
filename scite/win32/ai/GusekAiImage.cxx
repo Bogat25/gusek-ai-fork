@@ -1,289 +1,267 @@
 #include "GusekAiImage.h"
 #include <shellapi.h>
 #include <gdiplus.h>
+#include <memory>
 #pragma comment(lib, "gdiplus.lib")
 
 using namespace Gdiplus;
-
 static ULONG_PTR g_gdiplusToken = 0;
-static bool g_gdiplusInitialized = false;
-
 static const char b64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-static std::string Base64Encode(const unsigned char *data, size_t len) {
+static std::string Base64Encode(const unsigned char *data, size_t length) {
     std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    for (size_t i = 0; i < len; i += 3) {
-        unsigned int val = (data[i] << 16);
-        if (i + 1 < len) val |= (data[i+1] << 8);
-        if (i + 2 < len) val |= data[i+2];
-
-        out += b64_chars[(val >> 18) & 0x3F];
-        out += b64_chars[(val >> 12) & 0x3F];
-        out += (i + 1 < len) ? b64_chars[(val >> 6) & 0x3F] : '=';
-        out += (i + 2 < len) ? b64_chars[val & 0x3F] : '=';
+    out.reserve(((length + 2) / 3) * 4);
+    for (size_t i = 0; i < length; i += 3) {
+        unsigned int value = data[i] << 16;
+        if (i + 1 < length) value |= data[i + 1] << 8;
+        if (i + 2 < length) value |= data[i + 2];
+        out += b64_chars[(value >> 18) & 63];
+        out += b64_chars[(value >> 12) & 63];
+        out += i + 1 < length ? b64_chars[(value >> 6) & 63] : '=';
+        out += i + 2 < length ? b64_chars[value & 63] : '=';
     }
     return out;
 }
 
-static int GetEncoderClsid(const WCHAR *format, CLSID *pClsid) {
-    UINT num = 0, size = 0;
-    GetImageEncodersSize(&num, &size);
-    if (size == 0) return -1;
-
-    ImageCodecInfo *pInfo = (ImageCodecInfo *)(malloc(size));
-    if (!pInfo) return -1;
-
-    GetImageEncoders(num, size, pInfo);
-    for (UINT j = 0; j < num; ++j) {
-        if (wcscmp(pInfo[j].MimeType, format) == 0) {
-            *pClsid = pInfo[j].Clsid;
-            free(pInfo);
-            return j;
-        }
+static bool Encoder(const WCHAR *mime, CLSID &id) {
+    UINT count = 0, size = 0;
+    if (GetImageEncodersSize(&count, &size) != Ok || !size) return false;
+    std::vector<BYTE> buffer(size);
+    ImageCodecInfo *codecs = reinterpret_cast<ImageCodecInfo *>(&buffer[0]);
+    if (GetImageEncoders(count, size, codecs) != Ok) return false;
+    for (UINT i = 0; i < count; ++i) {
+        if (wcscmp(codecs[i].MimeType, mime) == 0) { id = codecs[i].Clsid; return true; }
     }
-    free(pInfo);
-    return -1;
+    return false;
 }
 
 void GusekAiImage::Initialize() {
-    if (!g_gdiplusInitialized) {
+    if (!g_gdiplusToken) {
         GdiplusStartupInput input;
-        GdiplusStartup(&g_gdiplusToken, &input, NULL);
-        g_gdiplusInitialized = true;
+        if (GdiplusStartup(&g_gdiplusToken, &input, NULL) != Ok) g_gdiplusToken = 0;
     }
 }
 
 void GusekAiImage::Shutdown() {
-    if (g_gdiplusInitialized) {
+    if (g_gdiplusToken) {
         GdiplusShutdown(g_gdiplusToken);
-        g_gdiplusInitialized = false;
+        g_gdiplusToken = 0;
     }
 }
 
-static bool ProcessGdiBitmap(Bitmap *pBmp, const std::string &name, ChatImageAttachment &outAttach) {
-    if (!pBmp || pBmp->GetLastStatus() != Ok) return false;
+void GusekAiImage::Release(ChatImageAttachment &image) {
+    if (image.hThumb) DeleteObject(image.hThumb);
+    if (image.hPreview) DeleteObject(image.hPreview);
+    image = ChatImageAttachment();
+}
 
-    // 1. Read EXIF orientation (PropertyTagOrientation = 0x0112)
-    UINT propSize = pBmp->GetPropertyItemSize(PropertyTagOrientation);
-    if (propSize > 0) {
-        PropertyItem *propItem = (PropertyItem *)malloc(propSize);
-        if (propItem) {
-            if (pBmp->GetPropertyItem(PropertyTagOrientation, propSize, propItem) == Ok) {
-                short orientation = *(short *)(propItem->value);
-                switch (orientation) {
-                case 3: pBmp->RotateFlip(Rotate180FlipNone); break;
-                case 6: pBmp->RotateFlip(Rotate90FlipNone); break;
-                case 8: pBmp->RotateFlip(Rotate270FlipNone); break;
-                default: break;
-                }
-            }
-            free(propItem);
+static bool Encode(Bitmap &image, const WCHAR *mime, std::vector<BYTE> &bytes) {
+    CLSID id;
+    if (!Encoder(mime, id)) return false;
+    IStream *stream = NULL;
+    if (FAILED(CreateStreamOnHGlobal(NULL, TRUE, &stream))) return false;
+    ULONG quality = 85;
+    EncoderParameters parameters;
+    parameters.Count = 1;
+    parameters.Parameter[0].Guid = EncoderQuality;
+    parameters.Parameter[0].Type = EncoderParameterValueTypeLong;
+    parameters.Parameter[0].NumberOfValues = 1;
+    parameters.Parameter[0].Value = &quality;
+    bool ok = image.Save(stream, &id, wcscmp(mime, L"image/jpeg") == 0 ? &parameters : NULL) == Ok;
+    STATSTG stat = {};
+    HGLOBAL memory = NULL;
+    if (ok) ok = SUCCEEDED(stream->Stat(&stat, STATFLAG_NONAME)) && stat.cbSize.QuadPart > 0 &&
+        stat.cbSize.QuadPart <= 16 * 1024 * 1024 && SUCCEEDED(GetHGlobalFromStream(stream, &memory));
+    if (ok) {
+        BYTE *data = static_cast<BYTE *>(GlobalLock(memory));
+        ok = data != NULL;
+        if (data) {
+            bytes.assign(data, data + static_cast<size_t>(stat.cbSize.QuadPart));
+            GlobalUnlock(memory);
         }
     }
+    stream->Release();
+    return ok;
+}
 
-    // 2. Downscale if max dimension > 1600
-    UINT w = pBmp->GetWidth();
-    UINT h = pBmp->GetHeight();
-    Bitmap *workBmp = pBmp;
-    bool deleteWorkBmp = false;
+bool GusekAiImage::ThumbnailPng(HBITMAP bitmap, std::vector<BYTE> &bytes) {
+    Initialize();
+    Bitmap image(bitmap, NULL);
+    return bitmap && image.GetLastStatus() == Ok && Encode(image, L"image/png", bytes);
+}
 
-    if (w > 1600 || h > 1600) {
-        double scale = 1600.0 / (double)(w > h ? w : h);
-        UINT nw = (UINT)(w * scale);
-        UINT nh = (UINT)(h * scale);
-        if (nw < 1) nw = 1;
-        if (nh < 1) nh = 1;
-
-        Bitmap *scaled = new Bitmap(nw, nh, PixelFormat32bppARGB);
-        Graphics g(scaled);
-        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-        g.DrawImage(pBmp, 0, 0, nw, nh);
-        workBmp = scaled;
-        deleteWorkBmp = true;
-        w = nw;
-        h = nh;
+static bool Process(Bitmap &original, const std::string &name, ChatImageAttachment &out) {
+    if (original.GetLastStatus() != Ok || !original.GetWidth() || !original.GetHeight() ||
+        static_cast<unsigned __int64>(original.GetWidth()) * original.GetHeight() > 64000000) return false;
+    UINT propertySize = original.GetPropertyItemSize(PropertyTagOrientation);
+    if (propertySize >= sizeof(PropertyItem)) {
+        std::vector<BYTE> data(propertySize);
+        PropertyItem *property = reinterpret_cast<PropertyItem *>(&data[0]);
+        if (original.GetPropertyItem(PropertyTagOrientation, propertySize, property) == Ok &&
+            property->type == PropertyTagTypeShort && property->length >= sizeof(short) && property->value) {
+            short orientation = *static_cast<short *>(property->value);
+            switch (orientation) {
+            case 2: original.RotateFlip(RotateNoneFlipX); break;
+            case 3: original.RotateFlip(Rotate180FlipNone); break;
+            case 4: original.RotateFlip(Rotate180FlipX); break;
+            case 5: original.RotateFlip(Rotate90FlipX); break;
+            case 6: original.RotateFlip(Rotate90FlipNone); break;
+            case 7: original.RotateFlip(Rotate270FlipX); break;
+            case 8: original.RotateFlip(Rotate270FlipNone); break;
+            }
+        }
     }
-
-    // 3. Encode to memory stream (PNG first, JPEG fallback if > 1.2MB)
-    CLSID pngClsid, jpgClsid;
-    GetEncoderClsid(L"image/png", &pngClsid);
-    GetEncoderClsid(L"image/jpeg", &jpgClsid);
-
-    IStream *pStream = NULL;
-    CreateStreamOnHGlobal(NULL, TRUE, &pStream);
-    if (!pStream) {
-        if (deleteWorkBmp) delete workBmp;
-        return false;
-    }
-
-    workBmp->Save(pStream, &pngClsid, NULL);
-
-    STATSTG stat;
-    pStream->Stat(&stat, STATFLAG_NONAME);
-    size_t size = (size_t)stat.cbSize.QuadPart;
-
-    std::string mime = "image/png";
-    if (size > 1200000) {
-        // Re-encode as JPEG
-        pStream->Release();
-        pStream = NULL;
-        CreateStreamOnHGlobal(NULL, TRUE, &pStream);
-
-        EncoderParameters params;
-        params.Count = 1;
-        params.Parameter[0].Guid = EncoderQuality;
-        params.Parameter[0].Type = EncoderParameterValueTypeLong;
-        params.Parameter[0].NumberOfValues = 1;
-        ULONG quality = 85;
-        params.Parameter[0].Value = &quality;
-
-        workBmp->Save(pStream, &jpgClsid, &params);
-        pStream->Stat(&stat, STATFLAG_NONAME);
-        size = (size_t)stat.cbSize.QuadPart;
+    UINT width = original.GetWidth(), height = original.GetHeight();
+    double scale = (std::min)(1.0, 1600.0 / (std::max)(width, height));
+    UINT targetWidth = (std::max)(1U, static_cast<UINT>(width * scale));
+    UINT targetHeight = (std::max)(1U, static_cast<UINT>(height * scale));
+    // Composite on white so transparent source pixels remain readable in JPEG.
+    Bitmap normalized(targetWidth, targetHeight, PixelFormat32bppARGB);
+    Graphics graphics(&normalized);
+    graphics.Clear(Color::White);
+    graphics.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    if (graphics.DrawImage(&original, 0, 0, targetWidth, targetHeight) != Ok) return false;
+    std::vector<BYTE> bytes;
+    if (!Encode(normalized, L"image/png", bytes)) return false;
+    const char *mime = "image/png";
+    if (bytes.size() > 1200000) {
+        if (!Encode(normalized, L"image/jpeg", bytes)) return false;
         mime = "image/jpeg";
     }
 
-    HGLOBAL hMem = NULL;
-    GetHGlobalFromStream(pStream, &hMem);
-    void *pBytes = GlobalLock(hMem);
-    std::string b64 = Base64Encode((const unsigned char *)pBytes, size);
-    GlobalUnlock(hMem);
-    pStream->Release();
-
-    // 4. Create thumbnail (max dimension ~160px for attachment strip)
-    UINT tw = w, th = h;
-    double tscale = 160.0 / (double)(w > h ? w : h);
-    if (tscale < 1.0) {
-        tw = (UINT)(w * tscale);
-        th = (UINT)(h * tscale);
+    double thumbScale = (std::min)(1.0, 160.0 / (std::max)(targetWidth, targetHeight));
+    UINT tw = (std::max)(1U, static_cast<UINT>(targetWidth * thumbScale));
+    UINT th = (std::max)(1U, static_cast<UINT>(targetHeight * thumbScale));
+    Bitmap thumbnail(tw, th, PixelFormat32bppARGB);
+    Graphics thumbGraphics(&thumbnail);
+    thumbGraphics.Clear(Color::White);
+    thumbGraphics.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    if (thumbGraphics.DrawImage(&normalized, 0, 0, tw, th) != Ok) return false;
+    ChatImageAttachment result;
+    if (thumbnail.GetHBITMAP(Color::White, &result.hThumb) != Ok ||
+        normalized.GetHBITMAP(Color::White, &result.hPreview) != Ok) {
+        GusekAiImage::Release(result);
+        return false;
     }
-    Bitmap thumb(tw, th, PixelFormat32bppARGB);
-    Graphics tg(&thumb);
-    tg.SetInterpolationMode(InterpolationModeHighQualityBilinear);
-    tg.DrawImage(workBmp, 0, 0, tw, th);
-
-    HBITMAP hThumb = NULL;
-    Color bg(255, 255, 255);
-    thumb.GetHBITMAP(bg, &hThumb);
-
-    if (deleteWorkBmp) delete workBmp;
-
-    outAttach.name = name;
-    outAttach.base64Png = "data:" + mime + ";base64," + b64;
-    outAttach.hThumb = hThumb;
+    result.name = name;
+    result.base64Png = std::string("data:") + mime + ";base64," + Base64Encode(&bytes[0], bytes.size());
+    out = result;
     return true;
 }
 
-bool GusekAiImage::LoadImageFromFile(const std::wstring &path, ChatImageAttachment &outAttach) {
+bool GusekAiImage::LoadImageFromFile(const std::wstring &path, ChatImageAttachment &out) {
     Initialize();
-    Bitmap *pBmp = new Bitmap(path.c_str());
+    if (!g_gdiplusToken) return false;
+    Bitmap original(path.c_str());
     std::string name = WideToUtf8(path);
     size_t slash = name.find_last_of("/\\");
     if (slash != std::string::npos) name = name.substr(slash + 1);
-
-    bool ok = ProcessGdiBitmap(pBmp, name, outAttach);
-    delete pBmp;
-    return ok;
+    return Process(original, name, out);
 }
 
-bool GusekAiImage::LoadImageFromClipboard(HWND hWndOwner, ChatImageAttachment &outAttach) {
+bool GusekAiImage::LoadImagesFromClipboard(HWND owner, std::vector<ChatImageAttachment> &out) {
     Initialize();
-    // Open clipboard with retry (up to 500ms)
     bool opened = false;
-    for (int i = 0; i < 10; i++) {
-        if (OpenClipboard(hWndOwner)) {
-            opened = true;
-            break;
-        }
+    for (int i = 0; i < 10; ++i) {
+        if (OpenClipboard(owner)) { opened = true; break; }
         Sleep(50);
     }
     if (!opened) return false;
-
-    bool ok = false;
-    // Check CF_HDROP first (file copied from Explorer)
-    if (IsClipboardFormatAvailable(CF_HDROP)) {
-        HDROP hDrop = (HDROP)GetClipboardData(CF_HDROP);
-        if (hDrop) {
-            UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
-            for (UINT i = 0; i < count; i++) {
-                WCHAR filePath[MAX_PATH];
-                if (DragQueryFileW(hDrop, i, filePath, MAX_PATH) > 0) {
-                    CloseClipboard();
-                    return LoadImageFromFile(filePath, outAttach);
-                }
-            }
+    std::vector<std::wstring> files;
+    HBITMAP copy = NULL;
+    HDROP drop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
+    if (drop) {
+        UINT count = (std::min)(16U, DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0));
+        for (UINT i = 0; i < count; ++i) {
+            UINT length = DragQueryFileW(drop, i, NULL, 0);
+            std::vector<wchar_t> path(length + 1);
+            if (DragQueryFileW(drop, i, &path[0], length + 1)) files.push_back(&path[0]);
         }
+    } else {
+        HBITMAP bitmap = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
+        if (bitmap) copy = static_cast<HBITMAP>(CopyImage(bitmap, IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION));
     }
-
-    // Check CF_BITMAP
-    if (IsClipboardFormatAvailable(CF_BITMAP)) {
-        HBITMAP hBmp = (HBITMAP)GetClipboardData(CF_BITMAP);
-        if (hBmp) {
-            Bitmap *pBmp = new Bitmap(hBmp, NULL);
-            ok = ProcessGdiBitmap(pBmp, "Clipboard Image", outAttach);
-            delete pBmp;
-        }
-    }
-
+    // Never hold the shared clipboard during decoding, scaling or encoding.
     CloseClipboard();
-    return ok;
+    for (size_t i = 0; i < files.size(); ++i) {
+        ChatImageAttachment image;
+        if (LoadImageFromFile(files[i], image)) out.push_back(image);
+    }
+    if (copy) {
+        Bitmap original(copy, NULL);
+        ChatImageAttachment image;
+        if (Process(original, "Clipboard image", image)) out.push_back(image);
+        DeleteObject(copy);
+    }
+    return !out.empty();
 }
 
-// Model viewer window
-static LRESULT CALLBACK ViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
+bool GusekAiImage::LoadImageFromClipboard(HWND owner, ChatImageAttachment &out) {
+    std::vector<ChatImageAttachment> images;
+    if (!LoadImagesFromClipboard(owner, images)) return false;
+    out = images[0];
+    for (size_t i = 1; i < images.size(); ++i) Release(images[i]);
+    return true;
+}
+
+static LRESULT CALLBACK ViewerWndProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    switch (message) {
+    case WM_CREATE:
+        SetWindowLongPtr(window, GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW *>(lp)->lpCreateParams));
+        return 0;
     case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) {
-            DestroyWindow(hWnd);
-            return 0;
-        }
+        if (wp == VK_ESCAPE) { DestroyWindow(window); return 0; }
         break;
+    case WM_SIZE:
+        InvalidateRect(window, NULL, TRUE);
+        return 0;
     case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd, &ps);
-        HBITMAP hbm = (HBITMAP)GetWindowLongPtr(hWnd, GWLP_USERDATA);
-        if (hbm) {
-            HDC memDC = CreateCompatibleDC(hdc);
-            HGDIOBJ old = SelectObject(memDC, hbm);
-            BITMAP bm;
-            GetObject(hbm, sizeof(bm), &bm);
+        PAINTSTRUCT paint;
+        HDC dc = BeginPaint(window, &paint);
+        HBITMAP bitmap = reinterpret_cast<HBITMAP>(GetWindowLongPtr(window, GWLP_USERDATA));
+        if (bitmap) {
+            BITMAP dimensions;
+            GetObject(bitmap, sizeof(dimensions), &dimensions);
             RECT rc;
-            GetClientRect(hWnd, &rc);
-            SetStretchBltMode(hdc, HALFTONE);
-            StretchBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
-            SelectObject(memDC, old);
-            DeleteDC(memDC);
+            GetClientRect(window, &rc);
+            double scale = (std::min)(static_cast<double>(rc.right) / dimensions.bmWidth,
+                                     static_cast<double>(rc.bottom) / dimensions.bmHeight);
+            int width = (std::max)(1, static_cast<int>(dimensions.bmWidth * scale));
+            int height = (std::max)(1, static_cast<int>(dimensions.bmHeight * scale));
+            HDC memory = CreateCompatibleDC(dc);
+            HGDIOBJ previous = SelectObject(memory, bitmap);
+            SetStretchBltMode(dc, HALFTONE);
+            StretchBlt(dc, (rc.right - width) / 2, (rc.bottom - height) / 2, width, height,
+                memory, 0, 0, dimensions.bmWidth, dimensions.bmHeight, SRCCOPY);
+            SelectObject(memory, previous);
+            DeleteDC(memory);
         }
-        EndPaint(hWnd, &ps);
+        EndPaint(window, &paint);
         return 0;
     }
-    case WM_DESTROY:
-        return 0;
+    case WM_NCDESTROY:
+        DeleteObject(reinterpret_cast<HBITMAP>(GetWindowLongPtr(window, GWLP_USERDATA)));
+        SetWindowLongPtr(window, GWLP_USERDATA, 0);
+        break;
     }
-    return DefWindowProcW(hWnd, msg, wParam, lParam);
+    return DefWindowProcW(window, message, wp, lp);
 }
 
-void GusekAiImage::ShowImageViewer(HWND hParent, const ChatImageAttachment &attach) {
-    if (!attach.hThumb) return;
-
-    WNDCLASSW wc = {0};
+void GusekAiImage::ShowImageViewer(HWND parent, const ChatImageAttachment &image) {
+    HBITMAP source = image.hPreview ? image.hPreview : image.hThumb;
+    if (!source) return;
+    HBITMAP copy = static_cast<HBITMAP>(CopyImage(source, IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION));
+    if (!copy) return;
+    WNDCLASSW wc = {};
     wc.lpfnWndProc = ViewerWndProc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.lpszClassName = L"GusekAiImageViewer";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
-
-    std::wstring title = L"Image: " + Utf8ToWide(attach.name);
-    HWND hViewer = CreateWindowExW(
-        WS_EX_TOPMOST, L"GusekAiImageViewer", title.c_str(),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 600, 450,
-        hParent, NULL, GetModuleHandle(NULL), NULL);
-
-    if (hViewer) {
-        SetWindowLongPtr(hViewer, GWLP_USERDATA, (LONG_PTR)attach.hThumb);
-        ShowWindow(hViewer, SW_SHOW);
-    }
+    HWND viewer = CreateWindowExW(0, wc.lpszClassName, (L"Picture: " + Utf8ToWide(image.name)).c_str(),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 720, 540,
+        parent, NULL, wc.hInstance, copy);
+    if (!viewer) DeleteObject(copy);
 }

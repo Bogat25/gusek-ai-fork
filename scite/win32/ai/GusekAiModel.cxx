@@ -1,5 +1,6 @@
 #include "GusekAiModel.h"
 #include "GusekAiHttp.h"
+#include "GusekAiDownload.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <fstream>
@@ -50,7 +51,7 @@ bool GusekAiModel::CheckHealth(const std::string &host, int port, HANDLE cancelE
 }
 
 static std::string ExtractLastLogError(const std::string &logPath) {
-    std::ifstream in(logPath.c_str());
+    std::ifstream in(Utf8ToWide(logPath).c_str());
     if (!in.is_open()) return "";
     std::string line;
     std::string lastErr;
@@ -83,22 +84,35 @@ bool GusekAiModel::EnsureRunning(const GusekAiConfig &config, std::string &outEr
         outError = "Stopped";
         return false;
     }
+    if (!config.autostart) {
+        outError = "Model autostart is disabled and no local server is ready";
+        return false;
+    }
     // Release handles from an earlier crashed process before starting another.
     Stop();
 
     // 2. Check if files exist
-    DWORD srvAttr = GetFileAttributesA(config.resolved_server_exe.c_str());
+    DWORD srvAttr = GetFileAttributesW(Utf8ToWide(config.resolved_server_exe).c_str());
     if (srvAttr == INVALID_FILE_ATTRIBUTES || (srvAttr & FILE_ATTRIBUTE_DIRECTORY)) {
         outError = "llama-server executable not found at: " + config.resolved_server_exe;
         return false;
     }
 
-    DWORD modAttr = GetFileAttributesA(config.resolved_model.c_str());
+    DWORD modAttr = GetFileAttributesW(Utf8ToWide(config.resolved_model).c_str());
     if (modAttr == INVALID_FILE_ATTRIBUTES || (modAttr & FILE_ATTRIBUTE_DIRECTORY)) {
         outError = "Model file not found. First-run download required.";
         return false;
     }
 
+    if (!GusekAiDownload::VerifyFileSha256(config.resolved_model, config.model_sha256, NULL, cancelEvent)) {
+        outError = "Model verification failed or was stopped; check its SHA-256 or download it again";
+        return false;
+    }
+    if (config.vision && GetFileAttributesW(Utf8ToWide(config.resolved_vision_model).c_str()) != INVALID_FILE_ATTRIBUTES &&
+        !GusekAiDownload::VerifyFileSha256(config.resolved_vision_model, config.vision_sha256, NULL, cancelEvent)) {
+        outError = "Picture reader verification failed or was stopped";
+        return false;
+    }
     // 3. Setup Job Object
     if (!m_hJob) {
         m_hJob = CreateJobObject(NULL, NULL);
@@ -131,7 +145,7 @@ bool GusekAiModel::EnsureRunning(const GusekAiConfig &config, std::string &outEr
     }
 
     if (config.vision) {
-        DWORD vAttr = GetFileAttributesA(config.resolved_vision_model.c_str());
+        DWORD vAttr = GetFileAttributesW(Utf8ToWide(config.resolved_vision_model).c_str());
         if (vAttr != INVALID_FILE_ATTRIBUTES && !(vAttr & FILE_ATTRIBUTE_DIRECTORY)) {
             cmd += " --mmproj \"" + config.resolved_vision_model + "\"";
             cmd += " --image-max-tokens " + std::to_string(config.image_max_tokens);
@@ -148,7 +162,7 @@ bool GusekAiModel::EnsureRunning(const GusekAiConfig &config, std::string &outEr
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
 
-    HANDLE hLog = CreateFileA(config.resolved_log_file.c_str(),
+    HANDLE hLog = CreateFileW(Utf8ToWide(config.resolved_log_file).c_str(),
                               GENERIC_WRITE,
                               FILE_SHARE_READ | FILE_SHARE_WRITE,
                               &sa,
@@ -156,7 +170,7 @@ bool GusekAiModel::EnsureRunning(const GusekAiConfig &config, std::string &outEr
                               FILE_ATTRIBUTE_NORMAL,
                               NULL);
 
-    STARTUPINFOA si;
+    STARTUPINFOW si;
     memset(&si, 0, sizeof(si));
     si.cb = sizeof(si);
     if (hLog != INVALID_HANDLE_VALUE) {
@@ -174,10 +188,9 @@ bool GusekAiModel::EnsureRunning(const GusekAiConfig &config, std::string &outEr
     size_t lastSlash = workDir.find_last_of("/\\");
     if (lastSlash != std::string::npos) workDir = workDir.substr(0, lastSlash);
 
-    std::vector<char> cmdBuf(cmd.begin(), cmd.end());
-    cmdBuf.push_back('\0');
+    std::wstring cmdBuf = Utf8ToWide(cmd);
 
-    BOOL created = CreateProcessA(
+    BOOL created = CreateProcessW(
         NULL,
         &cmdBuf[0],
         NULL,
@@ -185,7 +198,7 @@ bool GusekAiModel::EnsureRunning(const GusekAiConfig &config, std::string &outEr
         TRUE, // inherit handles for log
         CREATE_SUSPENDED | CREATE_NO_WINDOW,
         NULL,
-        workDir.c_str(),
+        Utf8ToWide(workDir).c_str(),
         &si,
         &pi);
 

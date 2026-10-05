@@ -118,6 +118,8 @@ protected:
 	int widthAiPane;
 	int widthAiPaneStartDrag;
 	bool aiVisible;
+	bool aiEnabled;
+	int aiHotkey;
 	bool capturedAiMouse;
 
 	// Solver execution tracking for AI assistant context
@@ -128,6 +130,7 @@ protected:
 
 	virtual int NormaliseSplit(int splitPos);
 	void ToggleAiAssistant();
+	void ConfigureAiAssistant();
 
 	// IGusekAiHost implementation
 	virtual std::string GetActiveDocumentText();

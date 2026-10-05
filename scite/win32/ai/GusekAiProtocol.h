@@ -8,6 +8,8 @@ struct ChatImageAttachment {
     std::string name;
     std::string base64Png; // data:image/png;base64,...
     HBITMAP hThumb;
+    HBITMAP hPreview;
+    ChatImageAttachment() : hThumb(NULL), hPreview(NULL) {}
 };
 
 struct ChatMessage {
