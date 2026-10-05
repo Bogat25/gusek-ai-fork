@@ -153,6 +153,9 @@ function Initialize-VcVars {
 function Find-InnoSetup {
     if ($InnoSetup -and (Test-Path $InnoSetup)) { return $InnoSetup }
     $candidates = @(
+        (Join-Path $BuildRoot 'tools\innosetup\ISCC.exe'),
+        'D:\rgui-build\tools\innosetup\ISCC.exe',
+        'D:\rstudio-build\tools\innosetup\ISCC.exe',
         'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
         'C:\Program Files\Inno Setup 6\ISCC.exe',
         'C:\Program Files (x86)\Inno Setup 7\ISCC.exe',
@@ -160,8 +163,19 @@ function Find-InnoSetup {
         'D:\Program Files\Inno Setup 6\ISCC.exe',
         (Join-Path $Cache 'inno\ISCC.exe')
     )
+    foreach ($key in 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1',
+                     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1',
+                     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1',
+                     'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1',
+                     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1',
+                     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1') {
+        try {
+            $loc = (Get-ItemProperty $key -ErrorAction Stop).InstallLocation
+            if ($loc) { $candidates += (Join-Path $loc 'ISCC.exe') }
+        } catch { }
+    }
     foreach ($c in $candidates) {
-        if (Test-Path $c) { return $c }
+        if ($c -and (Test-Path $c)) { return $c }
     }
     return $null
 }
@@ -332,7 +346,7 @@ function Do-FullBuild {
     # Copy runtime dependencies and assets from repo
     foreach ($item in @('glpsol.exe', 'glpk_4_65.dll', 'SciTEGlobal.properties', 'gmpl.properties',
                         'gnuplot.properties', 'python.properties', 'gusek.lua', 'gmpl.api', 'gmpl.abb',
-                        'README', 'gusek.html', 'examples', 'gusek_tips')) {
+                        'README', 'gusek.html', 'examples', 'gusek_tips', 'Start-Gusek.cmd')) {
         $src = Join-Path $Repo $item
         if (Test-Path $src) {
             Copy-Item $src $Stage -Recurse -Force
@@ -401,6 +415,46 @@ function Do-Clean {
     Note "Clean completed."
 }
 
+function Do-Installer {
+    Do-FullBuild
+    $iscc = Find-InnoSetup
+    if (-not $iscc) {
+        Stop-WithError "Inno Setup compiler (ISCC.exe) not found. Pass -InnoSetup <path>."
+    }
+    $iss = Join-Path $Repo 'packaging\gusek-ai.iss'
+    if (-not (Test-Path $iss)) {
+        Stop-WithError "Inno Setup script not found at $iss"
+    }
+
+    New-Item -ItemType Directory -Force -Path $Dist | Out-Null
+    Say "Compiling Inno Setup installer using $iscc..."
+    $proc = Start-Process -FilePath $iscc -ArgumentList @(
+        "/DAppVersion=$Version",
+        "/DStageDir=`"$Stage`"",
+        "/DOutputDir=`"$Dist`"",
+        "`"$iss`""
+    ) -Wait -PassThru -NoNewWindow
+
+    if ($proc.ExitCode -ne 0) {
+        Stop-WithError "ISCC compilation failed with code $($proc.ExitCode)"
+    }
+
+    $setupExe = Join-Path $Dist ("gusek-ai-{0}-setup.exe" -f $Version)
+    if (Test-Path $setupExe) {
+        $sha = (Get-FileHash -Algorithm SHA256 $setupExe).Hash.ToLowerInvariant()
+        Set-Content -Path "$setupExe.sha256" -Value "$sha *$((Get-Item $setupExe).Name)" -Encoding ASCII
+        Say "Installer ready: $setupExe"
+        Note "Installer SHA256: $sha"
+    } else {
+        $any = Get-ChildItem $Dist -Filter "gusek-ai-*-setup.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($any) {
+            $sha = (Get-FileHash -Algorithm SHA256 $any.FullName).Hash.ToLowerInvariant()
+            Set-Content -Path "$($any.FullName).sha256" -Value "$sha *$($any.Name)" -Encoding ASCII
+            Say "Installer ready: $($any.FullName)"
+        }
+    }
+}
+
 # ---------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------
@@ -425,12 +479,13 @@ switch ($Command) {
         New-Item -ItemType Directory -Force -Path $Dist | Out-Null
         $zipDest = Join-Path $Dist ("gusek-{0}-portable.zip" -f $Version)
         Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $zipDest -Force
+        $sha = (Get-FileHash -Algorithm SHA256 $zipDest).Hash.ToLowerInvariant()
+        Set-Content -Path "$zipDest.sha256" -Value "$sha *$((Get-Item $zipDest).Name)" -Encoding ASCII
         Note "Portable package ready: $zipDest"
+        Note "Portable package SHA256: $sha"
     }
     'installer' {
-        Do-FullBuild
-        Say "Building Inno Setup installer..."
-        # Will run ISCC on packaging/gusek-ai.iss
+        Do-Installer
     }
     'clean'     { Do-Clean }
 }

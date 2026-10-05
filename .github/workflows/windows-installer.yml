@@ -1,0 +1,103 @@
+name: Windows installer
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+      - '[0-9]*.[0-9]*.[0-9]*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUILD_ROOT: C:\gusek-build
+
+jobs:
+  installer:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate the version tag
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if ($env:REF_TYPE -eq 'tag') {
+            if ($env:REF_NAME -notmatch '^v?(\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?)$') {
+              throw "Tag '$($env:REF_NAME)' is not like v1.76.0 or 1.76.0-rc1"
+            }
+            $v = $Matches[1]
+          } else {
+            $v = "1.76.0-dev.$($env:RUN_NUMBER)"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Resolved version: $v"
+
+      - name: Cache downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.BUILD_ROOT }}\cache
+            ${{ env.BUILD_ROOT }}\tools\innosetup
+          key: gusek-downloads-${{ hashFiles('gusek.ps1') }}
+          restore-keys: gusek-downloads-
+
+      - name: Fetch pinned llama.cpp and Inno Setup
+        run: .\gusek.cmd fetch -NoModel -BuildRoot $env:BUILD_ROOT
+
+      - name: Build GUSEK and Scintilla
+        run: .\gusek.cmd full -BuildRoot $env:BUILD_ROOT
+
+      - name: Run unit and protocol tests
+        run: .\gusek.cmd test -BuildRoot $env:BUILD_ROOT
+
+      - name: Build portable distribution
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: .\gusek.cmd package -Version $env:VERSION -BuildRoot $env:BUILD_ROOT
+
+      - name: Build Inno Setup installer
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: .\gusek.cmd installer -Version $env:VERSION -BuildRoot $env:BUILD_ROOT
+
+      - name: Verify installer (install, launch, upgrade preservation, uninstall)
+        run: .\gusek.cmd test -Installer -BuildRoot $env:BUILD_ROOT
+
+      - name: Upload installer and portable package artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: GUSEK-AI-${{ steps.version.outputs.version }}-windows-x86
+          path: |
+            ${{ env.BUILD_ROOT }}\dist\gusek-ai-*-setup.exe
+            ${{ env.BUILD_ROOT }}\dist\gusek-ai-*-setup.exe.sha256
+            ${{ env.BUILD_ROOT }}\dist\gusek-*-portable.zip
+            ${{ env.BUILD_ROOT }}\dist\gusek-*-portable.zip.sha256
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gusek-build-logs-${{ github.run_id }}
+          path: ${{ env.BUILD_ROOT }}\logs\*.log
+          if-no-files-found: ignore
+          retention-days: 14

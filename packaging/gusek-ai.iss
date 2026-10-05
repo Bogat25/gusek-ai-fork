@@ -45,7 +45,7 @@ CloseApplications=yes
 Name: desktopicon; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "{#StageDir}\*"; DestDir: "{app}"; Excludes: "\ai\defaults\GusekAI.ini,\ai\defaults\system_prompt.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#StageDir}\*"; DestDir: "{app}"; Excludes: "GusekAI.ini,system_prompt.txt,*.gguf,*.part,*.log"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#StageDir}\ai\defaults\GusekAI.ini"; DestDir: "{app}\ai\defaults"; Flags: onlyifdoesntexist
 Source: "{#StageDir}\ai\defaults\system_prompt.txt"; DestDir: "{app}\ai\defaults"; Flags: onlyifdoesntexist
 

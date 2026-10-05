@@ -91,12 +91,18 @@ std::string GusekAiConfig::ResolvePath(const std::string &relOrAbs) const {
 void GusekAiConfig::Load(const std::string &appDir) {
     app_home = appDir;
 
-    // Determine data_dir (%LOCALAPPDATA%\GusekAI)
-    char localAppData[MAX_PATH] = {0};
-    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData))) {
-        data_dir = std::string(localAppData) + "\\GusekAI";
+    // Determine data_dir (%GUSEK_AI_DATA% or %LOCALAPPDATA%\GusekAI)
+    char envData[MAX_PATH] = {0};
+    DWORD envLen = GetEnvironmentVariableA("GUSEK_AI_DATA", envData, sizeof(envData));
+    if (envLen > 0 && envLen < sizeof(envData)) {
+        data_dir = envData;
     } else {
-        data_dir = app_home + "\\data";
+        char localAppData[MAX_PATH] = {0};
+        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData))) {
+            data_dir = std::string(localAppData) + "\\GusekAI";
+        } else {
+            data_dir = app_home + "\\data";
+        }
     }
     CreateDirectoryA(data_dir.c_str(), NULL);
     CreateDirectoryA((data_dir + "\\logs").c_str(), NULL);

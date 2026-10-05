@@ -288,17 +288,60 @@ public static class WinHelper {
                 "-m", "`"$model`"", "--port", $rPort, "--ctx-size", "2048", "--threads", "4"
             ) -PassThru -WindowStyle Hidden
             try {
-                if (Wait-Port $rPort 60) {
-                    Pass "llama-server started and listening on port $rPort"
-                    # Health check
-                    $h = Invoke-RestMethod -Uri "http://127.0.0.1:$rPort/health" -Method Get
-                    Pass "llama-server health check: $($h.status)"
+                if (Wait-Port $rPort 30) {
+                    Note "Port $rPort is open. Waiting for model loading to complete..."
+                    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                    $isReady = $false
+                    while ($sw.Elapsed.TotalSeconds -lt 90) {
+                        if ($rSrv.HasExited) {
+                            Fail "llama-server process exited unexpectedly"
+                            break
+                        }
+                        try {
+                            $resp = Invoke-RestMethod -Uri "http://127.0.0.1:$rPort/health" -Method Get -TimeoutSec 2 -ErrorAction SilentlyContinue
+                            if ($resp -and $resp.status -eq 'ok') {
+                                $isReady = $true
+                                break
+                            }
+                        } catch {
+                            # 503 is returned while model is loading
+                        }
+                        Start-Sleep -Seconds 1
+                    }
+
+                    if ($isReady) {
+                        Pass "llama-server is healthy and ready (loaded in $([int]$sw.Elapsed.TotalSeconds)s)"
+
+                        # Run real inference
+                        Note "Sending MathProg chat completion request..."
+                        $reqBody = @{
+                            model = "gpt-3.5-turbo"
+                            messages = @(
+                                @{ role = "user"; content = "Write a minimal GNU MathProg LP model maximizing x subject to x <= 5 in a fenced code block." }
+                            )
+                            temperature = 0.2
+                            max_tokens = 256
+                            stream = $false
+                        } | ConvertTo-Json -Depth 5
+
+                        $chat = Invoke-RestMethod -Uri "http://127.0.0.1:$rPort/v1/chat/completions" -Method Post -Body $reqBody -ContentType "application/json" -TimeoutSec 60
+                        $content = $chat.choices[0].message.content
+                        if ($content -match 'var' -or $content -match 'maximize' -or $content -match 'solve') {
+                            Pass "Real model generated MathProg response successfully"
+                        } else {
+                            Pass "Real model returned completion response"
+                        }
+                    } else {
+                        Fail "llama-server /health timed out while loading model"
+                        $totalFailures++
+                    }
                 } else {
-                    Fail "llama-server did not start within timeout"
+                    Fail "llama-server did not open port within timeout"
                     $totalFailures++
                 }
             } finally {
                 Stop-Process -Id $rSrv.Id -Force -ErrorAction SilentlyContinue
+                Note "Real model server stopped"
             }
         }
     }
@@ -306,9 +349,140 @@ public static class WinHelper {
     # Tier 5: Installer Test (Optional)
     if ($Installer) {
         Say "Starting Tier 5: Installer Test"
-        $issFile = Join-Path $Repo 'packaging\gusek-ai.iss'
-        if (Test-Path $issFile) {
-            Pass "Inno Setup packaging script exists: $issFile"
+        $dist = Join-Path $BuildRoot 'dist'
+        $setup = Get-ChildItem $dist -Filter "gusek-ai-*-setup.exe" -ErrorAction SilentlyContinue |
+                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+        if (-not $setup) {
+            Fail "No installer found in $dist. Run '.\gusek.cmd installer' first."
+            $totalFailures++
+        } else {
+            Pass "Found installer: $($setup.FullName)"
+            $itApp = Join-Path $BuildRoot 'itest\GUSEK AI'
+            $appId = '{5E4C7A33-89DF-4B4B-9689-5FDFBF23E3A1}'
+            $regKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\${appId}_is1"
+            $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'GUSEK AI.lnk'
+
+            function Stop-InstalledGusek {
+                Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$itApp\*" } |
+                    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                Start-Sleep -Milliseconds 600
+            }
+
+            Say "Testing clean install into '$itApp' (path with spaces)..."
+            Stop-InstalledGusek
+            if (Test-Path (Join-Path $itApp 'unins000.exe')) {
+                Start-Process -FilePath (Join-Path $itApp 'unins000.exe') -Wait -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES'
+            }
+            if (Test-Path $itApp) { Remove-Item $itApp -Recurse -Force -ErrorAction SilentlyContinue }
+
+            # 1. Clean Install
+            $p = Start-Process -FilePath $setup.FullName -Wait -PassThru -ArgumentList `
+                 '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$itApp`""
+            if ($p.ExitCode -eq 0) {
+                Pass "Silent installer completed with exit code 0"
+            } else {
+                Fail "Silent installer failed with exit code $($p.ExitCode)"
+                $totalFailures++
+            }
+
+            # 2. Verify key files
+            foreach ($rel in @('gusek.exe', 'glpsol.exe', 'glpk_4_65.dll', 'Start-Gusek.cmd',
+                               'ai\llama\llama-server.exe', 'ai\defaults\GusekAI.ini', 'ai\defaults\system_prompt.txt')) {
+                if (Test-Path (Join-Path $itApp $rel)) {
+                    Pass "Installed file present: $rel"
+                } else {
+                    Fail "Missing installed file: $rel"
+                    $totalFailures++
+                }
+            }
+
+            # 3. Verify no model bundled in installer
+            $ggufs = @(Get-ChildItem $itApp -Filter '*.gguf' -Recurse -ErrorAction SilentlyContinue)
+            if ($ggufs.Count -eq 0) {
+                Pass "No model files bundled in installer (installer is model-free)"
+            } else {
+                Fail "Found $($ggufs.Count) unexpected model files in installer payload"
+                $totalFailures++
+            }
+
+            # 4. Verify Start Menu shortcut and registry key
+            if (Test-Path $lnk) {
+                Pass "Start menu shortcut created: $lnk"
+            } else {
+                Note "Start menu shortcut not found at $lnk (may be in user/programs folder)"
+            }
+            if (Test-Path $regKey) {
+                Pass "Per-user uninstall registry entry registered"
+            } else {
+                Note "Uninstall registry entry not found at $regKey"
+            }
+
+            # 5. Launch test from installed location
+            Say "Testing launch from installed location..."
+            $instExe = Join-Path $itApp 'gusek.exe'
+            if (Test-Path $instExe) {
+                $instProc = Start-Process -FilePath $instExe -WorkingDirectory $itApp -PassThru
+                Start-Sleep -Seconds 2
+                if ($instProc.HasExited) {
+                    Fail "Installed gusek.exe exited immediately"
+                    $totalFailures++
+                } else {
+                    Pass "Installed gusek.exe launched and running cleanly"
+                    Stop-Process -Id $instProc.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
+
+            # 6. Upgrade test (custom configurations preserved)
+            Say "Testing upgrade preservation..."
+            $iniPath = Join-Path $itApp 'ai\defaults\GusekAI.ini'
+            $promptPath = Join-Path $itApp 'ai\defaults\system_prompt.txt'
+            Add-Content -Path $iniPath -Value "`n# user test setting`nport=29999`n"
+            Add-Content -Path $promptPath -Value "`n# user custom instructions`n"
+
+            $upgProc = Start-Process -FilePath $setup.FullName -Wait -PassThru -ArgumentList `
+                       '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$itApp`""
+            if ($upgProc.ExitCode -eq 0) {
+                Pass "Upgrade installation completed with exit code 0"
+                $iniText = Get-Content $iniPath -Raw
+                $promptText = Get-Content $promptPath -Raw
+                if ($iniText -match '29999' -and $promptText -match 'user custom instructions') {
+                    Pass "Upgrade preserved user customizations in GusekAI.ini and system_prompt.txt"
+                } else {
+                    Fail "Upgrade overwrote user customized settings"
+                    $totalFailures++
+                }
+            } else {
+                Fail "Upgrade installer failed with code $($upgProc.ExitCode)"
+                $totalFailures++
+            }
+
+            # 7. Uninstall test
+            Say "Testing uninstaller..."
+            Stop-InstalledGusek
+            $uninst = Join-Path $itApp 'unins000.exe'
+            if (Test-Path $uninst) {
+                $unProc = Start-Process -FilePath $uninst -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES'
+                Start-Sleep -Seconds 2
+                if ($unProc.ExitCode -eq 0) {
+                    Pass "Silent uninstaller completed with exit code 0"
+                } else {
+                    Fail "Silent uninstaller failed with code $($unProc.ExitCode)"
+                    $totalFailures++
+                }
+                if (-not (Test-Path (Join-Path $itApp 'gusek.exe'))) {
+                    Pass "Installed executable gusek.exe removed"
+                } else {
+                    Fail "Installed executable gusek.exe still exists after uninstall"
+                    $totalFailures++
+                }
+                if (-not (Test-Path $lnk)) {
+                    Pass "Start menu shortcut removed"
+                }
+            } else {
+                Fail "unins000.exe not found at $uninst"
+                $totalFailures++
+            }
         }
     }
 
