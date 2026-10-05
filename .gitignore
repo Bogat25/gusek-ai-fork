@@ -1,0 +1,16 @@
+# Build outputs and intermediate files
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.exe
+!glpsol.exe
+*.part
+*.bin
+*.zip
+*.log
+*~
+.vs/
+.vscode/
