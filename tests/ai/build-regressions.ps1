@@ -49,6 +49,51 @@ foreach ($invalid in @('65536.1.0','0.1.0/evil','0.1.0-..','99999999999999999999
 }
 Write-Host '[PASS] Windows version conversion preserves tags and rejects invalid components.'
 
+$innoFunctions = @('Get-InnoSetupVersion', 'Install-InnoSetup')
+foreach ($functionName in $innoFunctions) {
+    $definition = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $functionName
+    },$true)
+    if (-not $definition) { throw "Inno Setup function not found: $functionName" }
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$innoProbe = Join-Path $WorkRoot 'inno probe with spaces'
+New-Item -ItemType Directory -Force -Path $innoProbe | Out-Null
+foreach ($case in @(
+    @{ Name='unsupported'; Body=@('echo Unknown option: --version 1>&2','exit /b 1'); Expected=$null },
+    @{ Name='failed'; Body=@('echo 7.1.0','exit /b 1'); Expected=$null },
+    @{ Name='malformed'; Body=@('echo Not a compiler version','exit /b 0'); Expected=$null },
+    @{ Name='older'; Body=@('echo 6.5.4','exit /b 0'); Expected='6.5.4' },
+    @{ Name='pinned'; Body=@('echo 7.1.0','exit /b 0'); Expected='7.1.0' }
+)) {
+    $fixture = Join-Path $innoProbe ($case.Name + '.cmd')
+    Set-Content -LiteralPath $fixture -Value (@('@echo off') + $case.Body) -Encoding ASCII
+    if ((Get-InnoSetupVersion $fixture) -ne $case.Expected) {
+        throw "Inno Setup version probe failed: $($case.Name)"
+    }
+}
+Write-Host '[PASS] Inno probes tolerate unsupported options and reject failed or malformed responses.'
+& {
+    $BuildRoot = Join-Path $innoProbe 'fresh-build'
+    $InnoFile = 'pinned-inno.exe'
+    $InnoUrl = 'https://example.invalid/pinned-inno.exe'
+    $InnoSha256 = 'unused-probe-fixture'
+    function Find-InnoSetup { return $innoCandidate }
+    function Ensure-CacheFile { throw 'PINNED_INSTALL_REQUIRED' }
+    foreach ($name in @('unsupported','failed','malformed','older')) {
+        $innoCandidate = Join-Path $innoProbe ($name + '.cmd')
+        try {
+            $null = Install-InnoSetup
+            throw 'The pinned installer fallback was skipped.'
+        } catch {
+            if ($_.Exception.Message -ne 'PINNED_INSTALL_REQUIRED') { throw }
+        }
+    }
+}
+Write-Host '[PASS] Older or unusable runner compilers fall back to the pinned installer.'
+
 $releaseVersion = Join-Path $RepoRoot 'scripts\release-version.ps1'
 foreach ($case in @(
     @{ Tag='v1.2.3'; Version='1.2.3'; Prerelease='false' },

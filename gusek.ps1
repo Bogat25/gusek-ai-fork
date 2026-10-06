@@ -302,16 +302,29 @@ function Do-Doctor {
     }
 }
 
+function Get-InnoSetupVersion([string]$Compiler) {
+    # Older ISCC releases reject --version on stderr. With ErrorAction=Stop,
+    # Windows PowerShell raises NativeCommandError even when stderr is redirected.
+    # An unsupported probe must fall back to our pinned installer.
+    try {
+        $output = (& $Compiler --version 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $output -match '^\d+\.\d+\.\d+$') {
+            return $output
+        }
+    } catch { }
+    return $null
+}
+
 function Install-InnoSetup {
     $compiler = Join-Path $BuildRoot 'tools\innosetup\ISCC.exe'
     if (Test-Path -LiteralPath $compiler) {
-        if ((& $compiler --version 2>$null | Out-String).Trim() -ne '7.1.0') {
+        if ((Get-InnoSetupVersion $compiler) -ne '7.1.0') {
             Stop-WithError 'Cached compiler is not Inno Setup 7.1.0; select a fresh BuildRoot.'
         }
         return $compiler
     }
     $existing = Find-InnoSetup
-    if ($existing -and ((& $existing --version 2>$null | Out-String).Trim() -eq '7.1.0')) {
+    if ($existing -and ((Get-InnoSetupVersion $existing) -eq '7.1.0')) {
         $target = Split-Path $compiler -Parent
         New-Item -ItemType Directory -Force -Path $target | Out-Null
         Copy-Item -Path (Join-Path (Split-Path $existing -Parent) '*') -Destination $target -Recurse -Force
@@ -322,7 +335,8 @@ function Install-InnoSetup {
     $process = Start-Process -FilePath $setup -ArgumentList @(
         '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/NOICONS',"/DIR=""$toolDirectory"""
     ) -WindowStyle Hidden -Wait -PassThru
-    if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $compiler)) {
+    if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $compiler) -or
+        (Get-InnoSetupVersion $compiler) -ne '7.1.0') {
         Stop-WithError 'Could not install the pinned Inno Setup compiler for the current user.'
     }
     return $compiler

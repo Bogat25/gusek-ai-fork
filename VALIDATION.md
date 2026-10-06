@@ -103,6 +103,31 @@ and uploads the installer, ZIP and checksum files into a draft release before
 publishing it. Prereleases are marked appropriately. Manual runs only produce
 Actions artifacts. Existing releases are not overwritten.
 
+## GitHub runner correction (2026-10-06)
+
+The owner reported a failed hosted fetch step: the runner's existing ISCC.exe
+rejected --version. Windows PowerShell's ErrorAction=Stop promoted native stderr
+to NativeCommandError, aborting before the pinned compiler could be installed.
+The local release checks used Inno Setup 7.1.0 and missed this older-compiler path.
+
+Get-InnoSetupVersion now handles rejected probes, validates the exit code and
+version response, and allows Install-InnoSetup to fall back to the verified
+7.1.0 installer. A newly installed compiler is also checked before reuse.
+Build regressions cover unsupported options, failed commands with plausible
+version output, malformed output and an older version, including the pinned
+installer fallback. Those checks passed under Windows PowerShell 5.1.
+
+The original NativeCommandError was reproduced with a native command fixture
+that rejects --version. The actual gusek.cmd fetch -NoModel command then passed
+with that candidate and a fresh BuildRoot: it installed the real pinned compiler
+from its SHA-verified installer cache. Repeating fetch passed using the resulting
+7.1.0 compiler cache. No multi-gigabyte model download was needed. Evidence:
+D:\gusek-ci-fix-dbe58ca304c96\fetch-with-old-compiler.log and
+D:\gusek-ci-fix-dbe58ca304c96\fetch-with-cached-compiler.log.
+The fixture simulates the runner failure; an actual Inno Setup 6 compiler and a
+new hosted workflow run were not exercised locally. The application binaries
+and distribution hashes below are unchanged by this build-script correction.
+
 ## Artifacts and local evidence
 
 Build root: `D:\gusek-production-ceb842debe7b4491a332668cacaae638`.
@@ -148,8 +173,9 @@ See AI-README.md for use, configuration, build and release instructions.
 
 The packages are unsigned; Windows reputation checks can show a warning.
 Signing requires a separately provisioned certificate and is not configured.
-The first GitHub-hosted run remains unvalidated because GitHub access was
-kept read-only. The hosted workflow runs the native and simulated-backend GUI
+A successful GitHub-hosted run remains unverified; the reported first run failed
+in compiler detection, as recorded above. GitHub access was kept read-only.
+The hosted workflow runs the native and simulated-backend GUI
 suites, without downloading multi-gigabyte models; real CPU text/vision was
 validated locally.
 
