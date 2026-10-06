@@ -128,6 +128,35 @@ The fixture simulates the runner failure; an actual Inno Setup 6 compiler and a
 new hosted workflow run were not exercised locally. The application binaries
 and distribution hashes below are unchanged by this build-script correction.
 
+## Visual Studio runner correction (2026-10-06)
+
+Read-only inspection of the [v0.1.2 tag run](https://github.com/Bogat25/Gusek/actions/runs/37461439339)
+confirmed that the tag trigger works and the corrected compiler fetch passes.
+Its next step failed to find vcvarsall.bat. The runner's
+[documented image](https://github.com/actions/runner-images/blob/win25-vs2026/20260925.250/images/windows/Windows2025-VS2026-Readme.md)
+has Visual Studio 2026 Enterprise under Microsoft Visual Studio\18\Enterprise;
+the old hardcoded paths recognized only the local machine's 18\Community and
+older 2022/2019 installations.
+
+Builds and native tests now use the same scripts/find-vcvars.ps1 helper. It
+queries vswhere for all product editions with the x86/x64 C++ tools component,
+validates the returned environment script, respects an explicit -VcVars build
+override, and retains standard-path fallbacks when vswhere is unavailable.
+No compiler environment or inherited secret values are dumped.
+
+Regression checks passed for a simulated VS 2026 Enterprise installation in a
+path containing spaces, C++ component filtering, explicit overrides, invalid
+paths and failed queries. Actual discovery on the local machine selected VS
+2026 Community. A full Scintilla/GUSEK build then passed, followed by 87 native
+checks, the wrapper/tool regressions and 65 actual GUI checks. Real-model and
+installer suites were skipped in this follow-up; their earlier results above
+remain separate from these checks.
+
+Evidence: D:\gusek-ci-fix-dbe58ca304c96\vs-discovery-full-build.log and
+D:\gusek-ci-fix-dbe58ca304c96\vs-discovery-native-gui.log, with fixtures under
+BuildRoot\tests\run-c51937e433304fa4ac66f9980c36ab0f.
+No hosted run with this Visual Studio correction was triggered or verified.
+
 ## Artifacts and local evidence
 
 Build root: `D:\gusek-production-ceb842debe7b4491a332668cacaae638`.
@@ -173,8 +202,8 @@ See AI-README.md for use, configuration, build and release instructions.
 
 The packages are unsigned; Windows reputation checks can show a warning.
 Signing requires a separately provisioned certificate and is not configured.
-A successful GitHub-hosted run remains unverified; the reported first run failed
-in compiler detection, as recorded above. GitHub access was kept read-only.
+A successful GitHub-hosted run remains unverified; the reported runs failed
+in Inno Setup and Visual Studio detection, as recorded above. GitHub access was kept read-only.
 The hosted workflow runs the native and simulated-backend GUI
 suites, without downloading multi-gigabyte models; real CPU text/vision was
 validated locally.

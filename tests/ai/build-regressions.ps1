@@ -26,6 +26,38 @@ $tokens = $null
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $RepoRoot 'gusek.ps1'),[ref]$tokens,[ref]$errors)
+$findVcVars = Join-Path $RepoRoot 'scripts\find-vcvars.ps1'
+$toolchainProbe = Join-Path $WorkRoot 'VS toolchain with spaces'
+$fixtureVcVars = Join-Path $toolchainProbe '18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat'
+New-Item -ItemType Directory -Force -Path (Split-Path $fixtureVcVars -Parent) | Out-Null
+Set-Content -LiteralPath $fixtureVcVars -Value '@echo off' -Encoding ASCII
+$locator = Join-Path $toolchainProbe 'vswhere.cmd'
+Set-Content -LiteralPath $locator -Encoding ASCII -Value @(
+    '@echo off', 'echo %* > "%~dp0arguments.txt"', ('echo ' + $fixtureVcVars), 'exit /b 0'
+)
+if ((& $findVcVars -VsWhere $locator) -ne $fixtureVcVars) {
+    throw 'Discovery did not find the VS 2026 Enterprise fixture in a spaced path.'
+}
+$locatorArguments = Get-Content -LiteralPath (Join-Path $toolchainProbe 'arguments.txt') -Raw
+if ($locatorArguments -notmatch '-products \*' -or
+    $locatorArguments -notmatch '-requires Microsoft\.VisualStudio\.Component\.VC\.Tools\.x86\.x64' -or
+    $locatorArguments -notmatch '-find VC\\Auxiliary\\Build\\vcvarsall\.bat') {
+    throw 'Discovery did not request the required C++ component and compiler environment.'
+}
+if ((& $findVcVars -VcVars $fixtureVcVars -VsWhere (Join-Path $toolchainProbe 'absent.exe')) -ne $fixtureVcVars) {
+    throw 'An explicit compiler environment override was ignored.'
+}
+$rejected = $false
+try { $null = & $findVcVars -VcVars (Join-Path $toolchainProbe 'absent.bat') } catch { $rejected = $true }
+if (-not $rejected) { throw 'A nonexistent compiler environment override was accepted.' }
+Set-Content -LiteralPath $locator -Encoding ASCII -Value @('@echo off', ('echo ' + $fixtureVcVars), 'exit /b 1')
+if ((& $findVcVars -VsWhere $locator) -eq $fixtureVcVars) { throw 'A failed vswhere query was trusted.' }
+$actualVcVars = & $findVcVars
+if (-not $actualVcVars -or -not (Test-Path -LiteralPath $actualVcVars -PathType Leaf)) {
+    throw 'The actual installed C++ toolchain was not discovered.'
+}
+Write-Host '[PASS] C++ discovery handles VS 2026 Enterprise, spaces, component requirements, explicit overrides and failed queries.'
+
 $versionFunction = $ast.Find({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and

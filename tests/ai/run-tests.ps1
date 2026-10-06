@@ -23,12 +23,8 @@ $TempDir = Join-Path $Work 'tmp'
 New-Item -ItemType Directory -Force -Path $Native,$Profile,$TempDir | Out-Null
 
 function Find-VcVars {
-    foreach ($path in @(
-        'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat',
-        'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat',
-        'C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat',
-        'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat'
-    )) { if (Test-Path -LiteralPath $path) { return $path } }
+    $path = & (Join-Path $Repo 'scripts\find-vcvars.ps1')
+    if ($path) { return $path }
     throw 'MSVC C++ tools are required for the native checks.'
 }
 

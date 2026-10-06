@@ -61,6 +61,9 @@ folder's `work` directory and can travel with it.
 Install MSVC C++ tools and Python 3. Choose an absolute, writable build folder
 without spaces, outside the repository. The repository and installed app can
 have spaces in their paths.
+Builds and native tests share compiler discovery through Visual Studio's
+vswhere, including Enterprise, Community and Build Tools installations.
+Use -VcVars with a full vcvarsall.bat path to override build discovery.
 
 ```powershell
 .\gusek.cmd doctor -BuildRoot C:\gusek-build
