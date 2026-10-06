@@ -885,11 +885,26 @@ LRESULT CALLBACK GusekAiPane::InputSubclassProc(HWND hWnd, UINT msg, WPARAM wPar
 
     switch (msg) {
     case WM_KEYDOWN:
+        if (wParam == VK_INSERT && GetKeyState(VK_SHIFT) < 0 &&
+            GetKeyState(VK_CONTROL) >= 0 && GetKeyState(VK_MENU) >= 0) {
+            SendMessage(hWnd, WM_PASTE, 0, 0);
+            return 0;
+        }
         if (wParam == VK_RETURN) {
             if (GetKeyState(VK_CONTROL) < 0) {
                 pPane->SendQuestion();
                 return 0;
             }
+        }
+        break;
+
+    case WM_CHAR:
+        // RichEdit handles native Ctrl+V internally without sending WM_PASTE.
+        // Intercept its control character so pictures enter the attachment list
+        // instead of becoming an OLE object that is absent from the model request.
+        if (wParam == 22) {
+            SendMessage(hWnd, WM_PASTE, 0, 0);
+            return 0;
         }
         break;
 

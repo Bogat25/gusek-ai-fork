@@ -18,6 +18,8 @@ the runtime and models are installed, normal inference works offline.
 
 Use **Attach...** for the active model, solver output, recent output, picture
 files or clipboard pictures. PNG, JPEG, BMP, GIF and TIFF files are supported.
+You can also paste a screenshot into the question box with **Ctrl+V** or
+**Shift+Insert**. It appears in the attachment strip and is sent with the question.
 Click an attachment preview to open a larger viewer, and press **Esc** to close
 it. Its **x** removes that attachment. Sent pictures also have transcript
 thumbnails; double-click a thumbnail to open the viewer. Only the four newest

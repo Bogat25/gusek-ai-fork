@@ -114,6 +114,14 @@ static void TestProduction(const std::wstring &root) {
         if (i == 0) png = image; else GusekAiImage::Release(image);
     }
     {
+        graphics.Clear(Gdiplus::Color::White);
+        graphics.DrawString(L"68", -1, &font, Gdiplus::PointF(700, 100), &brush);
+        CLSID encoder;
+        TEST_ASSERT(TestEncoder(L"image/png", encoder) &&
+                    fixture.Save((root + L"\\clipboard-number.png").c_str(), &encoder, NULL) == Gdiplus::Ok,
+                    "A distinct clipboard vision fixture is generated without answer text");
+    }
+    {
         std::ifstream input((root + L"\\picture-42.jpg").c_str(), std::ios::binary);
         std::string jpeg((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         const BYTE exif[] = { 0xff,0xe1,0,34,'E','x','i','f',0,0,'I','I',42,0,8,0,0,0,

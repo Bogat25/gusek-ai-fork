@@ -157,6 +157,65 @@ D:\gusek-ci-fix-dbe58ca304c96\vs-discovery-native-gui.log, with fixtures under
 BuildRoot\tests\run-c51937e433304fa4ac66f9980c36ab0f.
 No hosted run with this Visual Studio correction was triggered or verified.
 
+## Screenshot paste correction (2026-10-06)
+
+The owner reported that Ctrl+V displayed a screenshot but the assistant asked
+for an image. In the actual staged application, RichEdit's native Ctrl+V
+control character (WM_CHAR, 22) embedded an OLE picture in the question box
+without adding an attachment: the captured chat request contained zero images.
+Sending WM_PASTE instead produced one PNG with the original 320x180 dimensions
+and identical pixels. The reproduction images are in
+`D:\gusek-images-864d6322537268\clipboard-source.png` and
+`paste-message-sent.png`.
+
+The question-box subclass now routes native Ctrl+V and Shift+Insert through
+the existing attachment paste handler. Screenshots belong to the attachment
+strip, where sending copies their image payload into the request and history.
+Plain text still uses RichEdit's text paste handler.
+
+New GUI regressions publish synthetic 24-bit CF_DIB and 32-bit CF_DIBV5
+screenshots, including a zero-alpha bitmap. They require one actual image
+payload, identical decoded PNG dimensions/pixels, opaque output, no embedded
+OLE picture, retained follow-up image bytes and normal Unicode text paste.
+The real-model suite also pastes a distinct screenshot containing 68 into a
+new conversation and requires answers of 68 and then 34, without answer hints
+in the prompt or filename. Clipboard snapshots retain opaque format handles;
+tests do not print existing clipboard contents.
+
+Measured checks for this correction:
+
+- Full Scintilla/GUSEK builds, portable packaging and installer compilation
+  passed. The installer and application manifests request `asInvoker`.
+- 88 fresh native checks and the build-wrapper/tool regressions passed.
+- All 65 existing GUI checks passed separately using a temporary baseline
+  runner that excluded the new clipboard block.
+- Eight real CPU checks passed before the clipboard step: the UI loaded,
+  the model warmed, generated MathProg solved successfully, reader installation
+  restarted the owned text server, vision read the attached file's number 42,
+  and a later text question returned half that number, 21.
+- The full GUI and real suites **did not pass**: Windows subsequently denied
+  `OpenClipboard` with error 5, including from standalone desktop probes.
+  The new pasted-screenshot checks and real answers 68/34 remain unverified
+  in this session. Shift+Insert was not exercised with physical key input.
+  Installation/upgrade/uninstall checks were not repeated for this UI change;
+  their earlier results remain separate.
+
+Evidence: `D:\gusek-images-864d6322537268\build.log`, `all-tests.log`,
+`gui-baseline.log`, `real-tests.log`, `package.log` and `installer.log`.
+Fresh native fixtures are under
+`D:\gusek-production-ceb842debe7b4491a332668cacaae638\tests\run-e0e053e66e9d4169919dac4adab7e806`.
+Rerun `gusek.cmd test -Real` when clipboard access is available to complete
+the screenshot validation. No hosted workflow was triggered.
+
+Patched local packages are in the production build root's `dist` folder:
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| gusek-0.1.4-portable.zip | 21,738,679 | `34d367590da0b69021d3526ccc4a6429cab0279626b0da0dc7aeba5fd3059d95` |
+| gusek-ai-0.1.4-setup.exe | 13,693,595 | `751c2ed6e962f79f63af617b7913a4e7727de4922fb1d3f1ce019739d2ae858f` |
+
+These packages contain the paste correction; the 0.1.1 artifacts below predate it.
+
 ## Artifacts and local evidence
 
 Build root: `D:\gusek-production-ceb842debe7b4491a332668cacaae638`.

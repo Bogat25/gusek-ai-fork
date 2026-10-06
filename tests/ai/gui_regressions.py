@@ -1,5 +1,6 @@
 """Exercise the built Win32 assistant with isolated profiles and loopback fixtures."""
 import argparse
+import base64
 import ctypes as C
 from ctypes import wintypes as W
 import hashlib
@@ -8,11 +9,13 @@ import json
 import os
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import zlib
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
@@ -55,6 +58,143 @@ k.CloseHandle.argtypes = [W.HANDLE]
 FENCE = chr(96) * 3
 MODEL_DATA = bytes(range(256)) * 4096
 CHECKS = 0
+
+
+class ClipboardFixture:
+    """Preserve clipboard handles opaquely while publishing synthetic fixtures."""
+    def __enter__(self):
+        self.ole = C.WinDLL('ole32')
+        self.ole.OleDuplicateData.argtypes = [W.HANDLE, C.c_ushort, C.c_uint]
+        self.ole.OleDuplicateData.restype = W.HANDLE
+        u.OpenClipboard.argtypes = [W.HWND]
+        u.OpenClipboard.restype = W.BOOL
+        u.DestroyWindow.argtypes = [W.HWND]
+        u.GetClipboardData.argtypes = [C.c_uint]
+        u.GetClipboardData.restype = W.HANDLE
+        u.SetClipboardData.argtypes = [C.c_uint, W.HANDLE]
+        u.SetClipboardData.restype = W.HANDLE
+        k.GlobalAlloc.argtypes = [C.c_uint, C.c_size_t]
+        k.GlobalAlloc.restype = W.HANDLE
+        k.GlobalLock.argtypes = [W.HANDLE]
+        k.GlobalLock.restype = C.c_void_p
+        k.GlobalUnlock.argtypes = [W.HANDLE]
+        k.GlobalFree.argtypes = [W.HANDLE]
+        k.GlobalFree.restype = W.HANDLE
+        u.CreateWindowExW.restype = W.HWND
+        u.CreateWindowExW.argtypes = [W.DWORD, W.LPCWSTR, W.LPCWSTR, W.DWORD,
+                                    C.c_int, C.c_int, C.c_int, C.c_int,
+                                    W.HWND, W.HMENU, W.HINSTANCE, C.c_void_p]
+        self.owner = u.CreateWindowExW(0, 'STATIC', 'Clipboard fixture', 0, 0, 0, 1, 1,
+                                       None, None, None, None)
+        if not self.owner:
+            raise C.WinError(C.get_last_error())
+        self.saved = []
+        try:
+            self.open()
+            try:
+                fmt = u.EnumClipboardFormats(0)
+                while fmt:
+                    handle = u.GetClipboardData(fmt)
+                    duplicate = self.ole.OleDuplicateData(handle, fmt, 0) if handle else None
+                    if not duplicate:
+                        raise RuntimeError('Cannot preserve a clipboard format for this test')
+                    self.saved.append((fmt, duplicate))
+                    fmt = u.EnumClipboardFormats(fmt)
+            finally:
+                u.CloseClipboard()
+        except BaseException:
+            u.DestroyWindow(self.owner)
+            raise
+        return self
+
+    def open(self):
+        try:
+            wait_for(lambda: u.OpenClipboard(self.owner), 5)
+        except TimeoutError:
+            raise C.WinError(C.get_last_error()) from None
+
+    def publish(self, fmt, payload):
+        self.open()
+        try:
+            if not u.EmptyClipboard():
+                raise C.WinError(C.get_last_error())
+            handle = k.GlobalAlloc(2, len(payload))
+            try:
+                pointer = k.GlobalLock(handle)
+                if not pointer:
+                    raise C.WinError(C.get_last_error())
+                C.memmove(pointer, payload, len(payload))
+                k.GlobalUnlock(handle)
+                if not u.SetClipboardData(fmt, handle):
+                    raise C.WinError(C.get_last_error())
+                handle = None  # Ownership passes to Windows on success.
+            finally:
+                if handle:
+                    k.GlobalFree(handle)
+        finally:
+            u.CloseClipboard()
+
+    def __exit__(self, *unused):
+        try:
+            self.open()
+            try:
+                if not u.EmptyClipboard():
+                    raise C.WinError(C.get_last_error())
+                for fmt, handle in self.saved:
+                    if not u.SetClipboardData(fmt, handle):
+                        raise C.WinError(C.get_last_error())
+            finally:
+                u.CloseClipboard()
+        finally:
+            u.DestroyWindow(self.owner)
+
+
+def png_pixels(data):
+    """Decode the lossless RGB/RGBA PNG emitted by GDI+ without extra packages."""
+    assert data.startswith(b'\x89PNG\r\n\x1a\n')
+    offset, compressed = 8, b''
+    while offset < len(data):
+        length = struct.unpack('>I', data[offset:offset + 4])[0]
+        kind, chunk = data[offset + 4:offset + 8], data[offset + 8:offset + 8 + length]
+        if kind == b'IHDR':
+            width, height, depth, color, _, _, interlace = struct.unpack('>IIBBBBB', chunk)
+            assert depth == 8 and color in (2, 6) and interlace == 0
+        elif kind == b'IDAT':
+            compressed += chunk
+        offset += length + 12
+    channels = 4 if color == 6 else 3
+    stride = width * channels
+    packed, prior, rows = zlib.decompress(compressed), bytearray(stride), []
+    for y in range(height):
+        start = y * (stride + 1)
+        mode, row = packed[start], bytearray(packed[start + 1:start + 1 + stride])
+        assert mode in range(5)
+        for x in range(stride):
+            left = row[x - channels] if x >= channels else 0
+            above, corner = prior[x], prior[x - channels] if x >= channels else 0
+            p = left + above - corner
+            nearest = min((left, above, corner), key=lambda v: abs(p - v))
+            predictor = (0, left, above, (left + above) // 2, nearest)[mode]
+            row[x] = (row[x] + predictor) & 255
+        if channels == 4:
+            assert all(row[x] == 255 for x in range(3, stride, 4)), 'Picture must be opaque to the model'
+        rows.append(bytes(v for x, v in enumerate(row) if x % channels < 3))
+        prior = row
+    return width, height, b''.join(rows)
+
+
+def screenshot_dib(width, height, rgb, v5=False):
+    stride = (width * 3 + 3) & ~3
+    rows = [rgb[y * width * 3:(y + 1) * width * 3] for y in range(height)]
+    if not v5:
+        pixels = b''.join(b''.join(row[x:x + 3][::-1] for x in range(0, len(row), 3)) +
+                          bytes(stride - width * 3) for row in reversed(rows))
+        return 8, struct.pack('<IiiHHIIiiII', 40, width, height, 1, 24, 0, len(pixels), 0, 0, 0, 0) + pixels
+    pixels = b''.join(b''.join(row[x:x + 3][::-1] + b'\0' for x in range(0, len(row), 3)) for row in reversed(rows))
+    header = bytearray(124)
+    struct.pack_into('<IiiHHIIiiII', header, 0, 124, width, height, 1, 32, 3, len(pixels), 0, 0, 0, 0)
+    struct.pack_into('<IIIII', header, 40, 0xff0000, 0xff00, 0xff, 0xff000000, 0x73524742)
+    return 17, bytes(header) + pixels
 
 
 def check(condition, description):
@@ -530,6 +670,37 @@ def exercise(stage, root, fixtures):
         app.send("PICTURE AFTER READER")
         check("ANSWER_FOR_PICTURE AFTER READER" in app.complete(), "Picture works after reader installation without restarting GUSEK")
         app.close()
+        app = App(stage, root, "clipboard-pictures", server.server_port, overrides={"vision": "yes"})
+        with ClipboardFixture() as clipboard:
+            width, height = 160, 96
+            rgb = b''.join(b'\xff\0\0' if x < width // 2 else b'\0\0\xff'
+                           for y in range(height) for x in range(width))
+            for v5, command in ((False, 0x0102), (True, 0x0302)):
+                message(app.pane, 0x0111, 3109)
+                clipboard.publish(*screenshot_dib(width, height, rgb, v5))
+                message(app.controls[3104], command, 22 if command == 0x0102 else 0)
+                check(bool(u.GetWindowLongW(app.controls[3103], -16) & 0x10000000),
+                      "Screenshot paste attaches a picture through " + ("native Ctrl+V" if command == 0x0102 else "WM_PASTE"))
+                check(text(app.controls[3104]) == "", "Screenshot paste keeps the question box free of embedded OLE pictures")
+                app.send("DESCRIBE SCREENSHOT")
+                app.complete()
+                parts = server.requests[-1]["messages"][-1]["content"]
+                urls = [p["image_url"]["url"] for p in parts if p["type"] == "image_url"]
+                check(len(urls) == 1, "Pasted screenshot is sent exactly once in the current question")
+                received = png_pixels(base64.b64decode(urls[0].split(',', 1)[1], validate=True))
+                check(received == (width, height, rgb), "Screenshot request preserves its actual dimensions and colored pixels")
+            app.send("SCREENSHOT FOLLOW-UP")
+            app.complete()
+            prior = server.requests[-1]["messages"][-3]["content"]
+            check(any(p["type"] == "image_url" and p["image_url"]["url"] == urls[0] for p in prior),
+                  "Follow-up retains the exact pasted screenshot bytes after the attachment strip clears")
+            message(app.pane, 0x0111, 3109)
+            plain = "Plain clipboard text: árvíztűrő 测试"
+            clipboard.publish(13, (plain + '\0').encode('utf-16le'))
+            message(app.controls[3104], 0x0102, 22)
+            check(text(app.controls[3104]) == plain and not (u.GetWindowLongW(app.controls[3103], -16) & 0x10000000),
+                  "Native Ctrl+V still pastes Unicode text without creating a picture")
+        app.close()
         legacy_document = root / "legacy.mod"
         original = b"# keep existing model\nvar y;\n"
         legacy_document.write_bytes(original)
@@ -709,6 +880,21 @@ def real_inference(stage, root, model, reader, fixtures):
         transcript = app.complete(120)
         answer = transcript.rsplit("GUSEK assistant", 1)[-1]
         check("21" in answer, "Actual picture history supports a later text-only follow-up")
+        message(app.pane, 0x0111, 3109)
+        with ClipboardFixture() as clipboard:
+            width, height, pixels = png_pixels((fixtures / "clipboard-number.png").read_bytes())
+            clipboard.publish(*screenshot_dib(width, height, pixels))
+            message(app.controls[3104], 0x0102, 22)
+            check(bool(u.GetWindowLongW(app.controls[3103], -16) & 0x10000000),
+                  "Native screenshot paste attaches to the actual CPU vision conversation")
+        app.send("Read the two-digit number printed in the picture. Reply with that number only.")
+        transcript = app.complete(180)
+        answer = transcript.rsplit("GUSEK assistant", 1)[-1]
+        check(answer.strip() == "68", "Actual CPU vision reads a different number from the pasted screenshot")
+        app.send("What is half the number in that picture? Reply with the result only.")
+        transcript = app.complete(120)
+        answer = transcript.rsplit("GUSEK assistant", 1)[-1]
+        check(answer.strip() == "34", "Actual pasted screenshot remains visible to the model in a follow-up")
         (app.root / "vision-transcript.txt").write_text(transcript, encoding="utf-8")
         app.send("Explain how the constraint bounds the optimum.")
         wait_for(lambda: "Answering" in text(app.controls[3101]), 10)
