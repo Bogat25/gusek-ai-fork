@@ -1,5 +1,9 @@
 # GUSEK: implementation plan for the local AI assistant
 
+Historical design record. Source import and implementation have since happened;
+use [current documentation](../docs/README.md) and [validation](../VALIDATION.md)
+for present behavior and remaining work. Paths below describe the original layout.
+
 Checked on 2026-10-04. Read [ai-assistant-porting-guide.md](ai-assistant-porting-guide.md)
 completely first. Its section 2 defines the behavior to reproduce; this plan
 maps it to the actual GUSEK checkout and replaces R-specific attachments and
@@ -8,7 +12,7 @@ not a report that the feature has already been implemented.
 
 ## 1. Workspace and baseline
 
-The repository to work in is **C:/0 User Related/Programing/gusek**, branch
+The repository to work in is the **gusek checkout**, branch
 **main**, inspected at **f4d7456**. It currently contains the packaged application,
 configuration, solver, manuals and examples. The editable application source
 is in **../Gusek-fork**, which currently has no Git metadata. Do not build a

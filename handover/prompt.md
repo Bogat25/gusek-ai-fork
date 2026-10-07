@@ -1,4 +1,7 @@
-Work in C:/0 User Related/Programing/gusek, on main. Implement the same local
+Historical implementation handover. Current usage and status are documented in
+README.md, docs/README.md, and VALIDATION.md; the source is now in this repository.
+
+Work in the gusek checkout, on main. Implement the same local
 offline assistant already present in the RGui and RStudio forks, adapted to
 GNU MathProg/GLPK and student optimization coursework.
 

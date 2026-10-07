@@ -1,5 +1,11 @@
 # GUSEK local assistant
 
+This guide describes the independent GUSEK AI hard fork. Local AI is the main
+goal; routine upstream synchronization is not planned. Start with the
+[repository README](README.md) or [documentation index](docs/README.md).
+The dated [validation report](VALIDATION.md) distinguishes measured results
+from the latest clipboard checks that still need a successful rerun.
+
 The Windows installer installs for the current user under
 `%LOCALAPPDATA%\Programs\GUSEK AI`. It requests no administrator elevation.
 The tested platform is Windows 11 x64; the installer targets Windows 10 1903
@@ -47,6 +53,12 @@ Course lookup also reads `.ai-context` next to the active document and the
 configured `context_dir`. It reads supported text/model files, excludes README
 scaffolding and files over 256 KiB, and bounds the total included excerpt.
 It does not scan every file beside the document.
+
+Reference selection is bounded keyword lookup, not web search, model training,
+an embedding database, or automatic PDF extraction. Convert relevant pages to
+text or attach them as images. Notes, screenshots, prompts, and logs remain
+ordinary local files without application encryption. Review excerpts before
+sending and redact them before publishing bug reports.
 
 Restart GUSEK after editing `GusekAI.ini`. Set `enabled=no` to remove the pane
 and menu, `hotkey=K` for Ctrl+Shift+K, or `autostart=no` to require an already

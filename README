@@ -1,3 +1,14 @@
+GUSEK AI - independent hard fork
+================================
+
+Local AI for MathProg/GLPK, solver output, pictures, and reference notes is
+this fork's main goal. Long-term synchronization with upstream is not planned.
+Open Tools > AI assistant (Ctrl+Shift+T) in a fresh AI build.
+See AI-README.md for assistant use; in the source checkout, README.md and
+docs/README.md contain the full public documentation and validation limits.
+
+Original upstream GUSEK information and license notices follow below.
+
 GUSEK (GLPK Under Scite Extended Kit) Version 0.2
 ©2008 Luiz Bettoni <bettoni@sollve.com.br>
 

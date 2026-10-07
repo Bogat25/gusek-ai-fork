@@ -14,3 +14,25 @@
 *~
 .vs/
 .vscode/
+
+# Generated editor libraries; retain the inherited GLPK redistributables.
+*.dll
+!glpk_4_65.dll
+!glpk_4_65_java.dll
+*.gguf
+*.sha256-ok
+__pycache__/
+
+# Local profiles, private reference material and credentials.
+/work/
+/.ai-context/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pfx
+*.p12
+*.dmp
+GusekAI.ini
+!ai/defaults/GusekAI.ini

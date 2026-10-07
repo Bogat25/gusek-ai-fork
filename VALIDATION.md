@@ -1,5 +1,13 @@
 # GUSEK AI release validation
 
+Current status (documentation review, 2026-10-07): the initial release checks
+below passed, but the later screenshot-paste correction's full clipboard GUI
+and real-model suites did not complete successfully. See **Screenshot paste
+correction (2026-10-06)** before treating the latest revision as fully verified.
+The [current documentation](docs/README.md) describes this independent hard fork.
+Evidence paths are expressed as local build/audit-root placeholders for public
+documentation; no original logs, user profiles, or clipboard data are published.
+
 Date: 2026-10-05. Reviewed baseline: `b46d8b05d11801410a41001d0031a4d02b0bee7f`, plus the changes in this commit.
 
 The local release checks pass on an unelevated Windows 11 Pro x64 session
@@ -122,8 +130,8 @@ that rejects --version. The actual gusek.cmd fetch -NoModel command then passed
 with that candidate and a fresh BuildRoot: it installed the real pinned compiler
 from its SHA-verified installer cache. Repeating fetch passed using the resulting
 7.1.0 compiler cache. No multi-gigabyte model download was needed. Evidence:
-D:\gusek-ci-fix-dbe58ca304c96\fetch-with-old-compiler.log and
-D:\gusek-ci-fix-dbe58ca304c96\fetch-with-cached-compiler.log.
+<ci-audit-root>\fetch-with-old-compiler.log and
+<ci-audit-root>\fetch-with-cached-compiler.log.
 The fixture simulates the runner failure; an actual Inno Setup 6 compiler and a
 new hosted workflow run were not exercised locally. The application binaries
 and distribution hashes below are unchanged by this build-script correction.
@@ -152,8 +160,8 @@ checks, the wrapper/tool regressions and 65 actual GUI checks. Real-model and
 installer suites were skipped in this follow-up; their earlier results above
 remain separate from these checks.
 
-Evidence: D:\gusek-ci-fix-dbe58ca304c96\vs-discovery-full-build.log and
-D:\gusek-ci-fix-dbe58ca304c96\vs-discovery-native-gui.log, with fixtures under
+Evidence: <ci-audit-root>\vs-discovery-full-build.log and
+<ci-audit-root>\vs-discovery-native-gui.log, with fixtures under
 BuildRoot\tests\run-c51937e433304fa4ac66f9980c36ab0f.
 No hosted run with this Visual Studio correction was triggered or verified.
 
@@ -165,7 +173,7 @@ control character (WM_CHAR, 22) embedded an OLE picture in the question box
 without adding an attachment: the captured chat request contained zero images.
 Sending WM_PASTE instead produced one PNG with the original 320x180 dimensions
 and identical pixels. The reproduction images are in
-`D:\gusek-images-864d6322537268\clipboard-source.png` and
+`<image-audit-root>\clipboard-source.png` and
 `paste-message-sent.png`.
 
 The question-box subclass now routes native Ctrl+V and Shift+Insert through
@@ -200,10 +208,10 @@ Measured checks for this correction:
   Installation/upgrade/uninstall checks were not repeated for this UI change;
   their earlier results remain separate.
 
-Evidence: `D:\gusek-images-864d6322537268\build.log`, `all-tests.log`,
+Evidence: `<image-audit-root>\build.log`, `all-tests.log`,
 `gui-baseline.log`, `real-tests.log`, `package.log` and `installer.log`.
 Fresh native fixtures are under
-`D:\gusek-production-ceb842debe7b4491a332668cacaae638\tests\run-e0e053e66e9d4169919dac4adab7e806`.
+`<BuildRoot>\tests\run-e0e053e66e9d4169919dac4adab7e806`.
 Rerun `gusek.cmd test -Real` when clipboard access is available to complete
 the screenshot validation. No hosted workflow was triggered.
 
@@ -218,7 +226,7 @@ These packages contain the paste correction; the 0.1.1 artifacts below predate i
 
 ## Artifacts and local evidence
 
-Build root: `D:\gusek-production-ceb842debe7b4491a332668cacaae638`.
+Build root: `<BuildRoot>`.
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
