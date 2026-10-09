@@ -21,11 +21,16 @@ It is not a filesystem-wide index, an Internet search engine, or a training job.
 Reference text and model output are untrusted suggestions. Automatic solver/code
 execution is outside the assistant's behavior.
 
+The host starts the pane hidden and ignores legacy `ai.visible` preferences.
+Its event loop dispatches the configured Ctrl+Shift+letter without a menu
+command, including while the question box has focus. Holding the key does not
+toggle repeatedly; Alt-modified chords and modal dialogs retain normal behavior.
+
 ## Source map
 
 | Location | Responsibility |
 | --- | --- |
-| [SciTEWin.cxx](../scite/win32/SciTEWin.cxx), [SciTEWin.h](../scite/win32/SciTEWin.h) | Menu, shortcut, pane lifecycle, layout and host callbacks |
+| [SciTEWin.cxx](../scite/win32/SciTEWin.cxx), [SciTEWin.h](../scite/win32/SciTEWin.h) | Shortcut, pane lifecycle, layout and host callbacks |
 | [GusekAiPane](../scite/win32/ai/GusekAiPane.cxx), [GusekAiHost.h](../scite/win32/ai/GusekAiHost.h) | Controls, request state, explicit attachments and editor insertion |
 | [GusekAiConfig](../scite/win32/ai/GusekAiConfig.cxx) | Defaults, user overrides, paths, system prompt and reference selection |
 | [GusekAiModel](../scite/win32/ai/GusekAiModel.cxx) | Health checks, CPU process launch, ownership, startup and cleanup |
@@ -48,11 +53,12 @@ RichEdit can embed a pasted bitmap as an OLE object without attaching it to a
 model request. The paste correction routes native Ctrl+V/Shift+Insert through the
 attachment handler so images become actual request payloads. The regression
 contract checks decoded pixels and follow-up bytes, not just visible thumbnails.
-The new full clipboard checks remain unverified in the last recorded session.
+Synthetic clipboard request checks passed in the 2026-10-09 staged GUI run;
+real-model screenshot recognition was not rerun in that pass.
 
 ## Fork relationship and maintenance
 
-RGui AI uses C/GraphApp with R context; RStudio AI uses the existing Chat
+RGui AI uses C/GraphApp with R context; RStudio uses the existing Chat
 session/GWT/Node stack; GUSEK AI uses C++/SciTE with MathProg context. Their default
 model ports are 8713, 18713, and 28713 respectively. Profiles and process ownership
 are independent; public model assets may be reused by build tools only after

@@ -37,6 +37,10 @@ u.GetMenu.restype = W.HMENU
 u.GetMenuState.argtypes = [W.HMENU, W.UINT, W.UINT]
 u.GetMenuState.restype = W.UINT
 u.GetMenuStringW.argtypes = [W.HMENU, W.UINT, W.LPWSTR, C.c_int, W.UINT]
+u.AttachThreadInput.argtypes = [W.DWORD, W.DWORD, W.BOOL]
+u.GetKeyboardState.argtypes = [C.POINTER(C.c_ubyte)]
+u.SetKeyboardState.argtypes = [C.POINTER(C.c_ubyte)]
+u.PeekMessageW.argtypes = [C.POINTER(W.MSG), W.HWND, W.UINT, W.UINT, W.UINT]
 class GuiThreadInfo(C.Structure):
     _fields_ = [("cbSize", W.DWORD), ("flags", W.DWORD), ("active", W.HWND),
                 ("focus", W.HWND), ("capture", W.HWND), ("menu", W.HWND),
@@ -58,6 +62,32 @@ k.CloseHandle.argtypes = [W.HANDLE]
 FENCE = chr(96) * 3
 MODEL_DATA = bytes(range(256)) * 4096
 CHECKS = 0
+
+
+def shortcut(target, key, changed, repeat=False, alt=False):
+    """Exercise the real event loop without taking foreground focus."""
+    msg = W.MSG()
+    u.PeekMessageW(C.byref(msg), None, 0, 0, 0)  # Create this thread's message queue.
+    current = k.GetCurrentThreadId()
+    owner = u.GetWindowThreadProcessId(target, None)
+    if not u.AttachThreadInput(current, owner, True):
+        raise C.WinError(C.get_last_error())
+    saved = (C.c_ubyte * 256)()
+    try:
+        if not u.GetKeyboardState(saved):
+            raise C.WinError(C.get_last_error())
+        state = (C.c_ubyte * 256).from_buffer_copy(saved)
+        state[0x11], state[0x10], state[0x12] = 0x80, 0x80, 0x80 if alt else 0
+        if not u.SetKeyboardState(state):
+            raise C.WinError(C.get_last_error())
+        if not u.PostMessageW(target, 0x0100, ord(key.upper()), 1 | ((1 << 30) if repeat else 0)):
+            raise C.WinError(C.get_last_error())
+        time.sleep(0.1)
+        wait_for(changed)
+    finally:
+        u.PostMessageW(target, 0x0101, ord(key.upper()), (1 << 30) | (1 << 31) | 1)
+        u.SetKeyboardState(saved)
+        u.AttachThreadInput(current, owner, False)
 
 
 class ClipboardFixture:
@@ -133,6 +163,10 @@ class ClipboardFixture:
                     k.GlobalFree(handle)
         finally:
             u.CloseClipboard()
+
+        # Windows clipboard services may briefly reopen newly published data.
+        # Allow that handoff before injecting paste into another process.
+        time.sleep(0.4)
 
     def __exit__(self, *unused):
         try:
@@ -410,7 +444,7 @@ class App:
         startup.dwFlags = subprocess.STARTF_USESHOWWINDOW
         startup.wShowWindow = 0
         command = [str(stage / "gusek.exe"), "-check.if.already.open=0",
-                   "-save.session=0", "-save.position=0", "-save.recent=0"]
+                   "-save.session=0", "-save.position=0", "-save.recent=0", "-ai.visible=1"]
         if extra:
             command.extend(extra)
         if document:
@@ -420,15 +454,21 @@ class App:
             self.main = wait_for(lambda: next(
                 (h for h in windows(pid=self.process.pid) if window_class(h) == "SciTEWindow"), None))
             u.ShowWindow(self.main, 0)
-            message(self.main, 0x0111, 470)
+            check(u.GetMenuState(u.GetMenu(self.main), 470, 0) == 0xFFFFFFFF,
+                  name + ": no assistant menu entry")
+            self.hotkey = values.get("hotkey", "T")
+            for argument in extra or []:
+                if argument.startswith("-ai.hotkey="):
+                    self.hotkey = argument.split("=", 1)[1]
             if disabled:
+                shortcut(self.main, self.hotkey, lambda: True)
                 check(not any(window_class(h) == "GusekAiPaneClass" for h in windows(self.main)),
                       "Disabled AI creates no pane or runtime")
-                check(u.GetMenuState(u.GetMenu(self.main), 470, 0) == 0xFFFFFFFF,
-                      "Disabled AI removes its Tools menu entry")
                 return
             self.pane = wait_for(lambda: next(
                 (h for h in windows(self.main) if window_class(h) == "GusekAiPaneClass"), None))
+            check(not self.visible(), name + ": assistant starts closed despite ai.visible=1")
+            self.toggle(self.main)
             self.controls = {u.GetDlgCtrlID(h): h for h in windows(self.pane)}
             self.before_transcript = text(self.controls[3102])
             check(all(i in self.controls for i in (3101, 3102, 3104, 3105, 3106)),
@@ -436,6 +476,15 @@ class App:
         except BaseException:
             self.close()
             raise
+
+    def visible(self):
+        return bool(u.GetWindowLongW(self.pane, -16) & 0x10000000)
+
+    def toggle(self, target=None, repeat=False, alt=False):
+        expected = self.visible() if repeat or alt else not self.visible()
+        shortcut(target or self.controls[3104], self.hotkey,
+                 lambda: self.visible() == expected, repeat, alt)
+        check(self.visible() == expected, "Configured shortcut toggles the pane from its actual controls")
 
     def send(self, question):
         buffer = C.create_unicode_buffer(question)
@@ -526,7 +575,7 @@ def exercise(stage, root, fixtures):
     try:
         app = App(stage, root, "chat", server.server_port)
         visible = lambda: bool(u.GetWindowLongW(app.pane, -16) & 0x10000000)
-        check(visible(), "Menu shows assistant pane")
+        check(visible(), "Shortcut shows assistant pane")
         check(focus(app.main) == app.controls[3104], "Opening the pane focuses the question box")
         u.PostMessageW(app.controls[3104], 0x0100, 9, 1)
         wait_for(lambda: focus(app.main) == app.controls[3105])
@@ -538,9 +587,11 @@ def exercise(stage, root, fixtures):
         app.complete()
         check(True, "Enter activates a focused assistant button")
         message(app.pane, 0x0111, 3109)
-        message(app.main, 0x0111, 470)
-        check(not visible(), "Menu hides assistant pane")
-        message(app.main, 0x0111, 470)
+        app.toggle()
+        check(not visible(), "Shortcut hides assistant pane from the question box")
+        check(window_class(focus(app.main)) == "Scintilla" and
+              u.GetDlgCtrlID(focus(app.main)) == 350, "Closing the assistant returns focus to the editor")
+        app.toggle(app.main)
         app.send("FIRST")
         check("ANSWER_FOR_FIRST" in app.complete(), "First streamed answer is visible")
         app.send("SECOND")
@@ -605,9 +656,10 @@ def exercise(stage, root, fixtures):
         (course / "README.md").write_text("EXCLUDED_README_SENTINEL", encoding="utf-8")
         app = App(stage, root, "árvíztűrő-测试", server.server_port,
                   overrides={"context_dir": str(course), "hotkey": "K"})
-        label = C.create_unicode_buffer(256)
-        u.GetMenuStringW(u.GetMenu(app.main), 470, label, len(label), 0)
-        check("Ctrl+Shift+K" in label.value, "The configured shortcut is displayed in the Tools menu")
+        app.toggle(repeat=True)
+        app.toggle(alt=True)
+        app.toggle()
+        app.toggle(app.main)
         (app.root / "system_prompt.txt").write_text("CUSTOM_PROMPT_SENTINEL", encoding="utf-8")
         app.send("optimization")
         app.complete()

@@ -34,20 +34,26 @@ model downloads need Internet access; inference works offline afterward.
    when available. Compare its SHA-256 against the adjacent checksum file.
 2. Run the installer, or extract the portable ZIP into a writable folder and
    start `Start-Gusek.cmd`. The installer installs for the current user.
-3. Open **Tools > AI assistant**, or press **Ctrl+Shift+T**.
+3. Press **Ctrl+Shift+T** to open or close the assistant.
 4. Accept the initial model/picture-reader download, about **3.4 GB** combined.
 5. Enter a question and select **Send** or **Ctrl+Enter**. Use **Stop** to cancel
    loading, generation, or downloading.
+
+The assistant always starts closed, including with an older `ai.visible=1`
+setting. The keyboard shortcut is the only opening control; there are no
+assistant menu entries or toolbar buttons. The same shortcut closes the pane
+from its question box, preserving the conversation. Configure its letter with
+`hotkey` in `GusekAI.ini` or `ai.hotkey` in SciTE properties.
 
 Windows 11 x64 is the tested release environment. The installer targets Windows
 10 1903+; broader platform coverage is not established. Packages are unsigned.
 The legacy `gusek.exe` retained at the source root predates the assistant; use a
 fresh fork build or release package for AI features.
 
-**Current validation limit:** the screenshot-paste correction is implemented,
-but its new end-to-end clipboard checks still need a successful rerun after
-Windows denied clipboard access in the validation session. Earlier file-image
-inference passed. See [VALIDATION.md](VALIDATION.md) for exact evidence and limits.
+**Validation:** native tests and the staged GUI suite pass, including screenshot
+paste request pixels and follow-up bytes. Real-model screenshot recognition and
+installed/portable checks have not been rerun for this revision. See
+[VALIDATION.md](VALIDATION.md) for measured evidence and limits.
 
 ## Reference notes and settings
 

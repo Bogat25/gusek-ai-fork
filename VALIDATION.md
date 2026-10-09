@@ -1,9 +1,10 @@
 # GUSEK AI release validation
 
-Current status (documentation review, 2026-10-07): the initial release checks
-below passed, but the later screenshot-paste correction's full clipboard GUI
-and real-model suites did not complete successfully. See **Screenshot paste
-correction (2026-10-06)** before treating the latest revision as fully verified.
+Current status (2026-10-09): the shortcut-only changes build successfully.
+Fresh native tests (88/88), build/release helper checks and all 127 staged GUI
+assertions passed. Clipboard screenshot payload checks now pass; real-model
+screenshot inference and installed/portable checks were not rerun in this pass.
+See **Shortcut-only assistant access (2026-10-09)** for current evidence.
 The [current documentation](docs/README.md) describes this independent hard fork.
 Evidence paths are expressed as local build/audit-root placeholders for public
 documentation; no original logs, user profiles, or clipboard data are published.
@@ -14,6 +15,35 @@ The local release checks pass on an unelevated Windows 11 Pro x64 session
 (OS build 10.0.26200). Version 0.1.1 installer and portable packages are built.
 The GitHub release workflow is prepared locally; no GitHub workflow was
 triggered and no release was published.
+
+## Shortcut-only assistant access (2026-10-09)
+
+The assistant always starts closed, even with legacy `ai.visible=1`. Its Tools
+menu entry and menu command were removed. The configured Ctrl+Shift+letter
+(default Ctrl+Shift+T) opens/closes it from the editor and question box, without
+losing the current conversation. Auto-repeat and Alt-modified chords do not
+toggle the pane. Closing it returns keyboard focus to the editor.
+
+Local Windows 11 checks:
+
+- Full MSVC x86 release build and final incremental rebuild passed.
+- Native protocol, configuration, image and actual-control checks: **88/88**.
+- Build/release helper regression checks: passed.
+- Final actual staged GUI run: **127 assertions passed**, including default and
+  custom shortcuts, initially closed panes despite `ai.visible=1`, no assistant
+  menu entries, disabled AI, streaming/history/cancellation, downloads, Unicode,
+  file images and clipboard screenshot request pixels/bytes.
+
+The clipboard fixture now allows 400 ms for Windows clipboard services to
+finish handling newly published synthetic data before injecting paste. An
+immediate injected plain-text paste previously raced that handoff; retrying it
+succeeded. This changes test synchronization, not application paste behavior.
+Clipboard formats are preserved opaquely and restored; no clipboard contents
+or original user profiles are checked into the repository.
+
+The real CPU screenshot-recognition pass, installer/portable suites and hosted
+workflow were not rerun for this change. The earlier dated results below remain
+historical evidence, not measurements of this revision's installed packages.
 
 ## Changes and evaluation
 

@@ -131,8 +131,6 @@ BEGIN
 	MENUITEM "&Previous Message\tShift+F4",IDM_PREVMSG
 	MENUITEM "Clear &Output\tShift+F5",	IDM_CLEAROUTPUT
 	MENUITEM "&Switch Pane\tCtrl+F6",	IDM_SWITCHPANE
-	MENUITEM SEPARATOR
-	MENUITEM "&AI assistant\tCtrl+Shift+T",	IDM_AIASSISTANT
 END
 
 POPUP "&Options"

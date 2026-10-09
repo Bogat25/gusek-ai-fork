@@ -4,17 +4,24 @@ This guide describes the independent GUSEK AI hard fork. Local AI is the main
 goal; routine upstream synchronization is not planned. Start with the
 [repository README](README.md) or [documentation index](docs/README.md).
 The dated [validation report](VALIDATION.md) distinguishes measured results
-from the latest clipboard checks that still need a successful rerun.
+from real-model/installed checks that were not rerun in the latest pass.
 
 The Windows installer installs for the current user under
 `%LOCALAPPDATA%\Programs\GUSEK AI`. It requests no administrator elevation.
 The tested platform is Windows 11 x64; the installer targets Windows 10 1903
 and later. The installer is unsigned, so Windows may show a reputation warning.
 
-Open **Tools > AI assistant**, or press **Ctrl+Shift+T**. Write a question and
+Press **Ctrl+Shift+T** to open or close the assistant. Write a question and
 press **Send** or **Ctrl+Enter** in the question box. Opening the pane warms an
 installed model in the background. **Stop** cancels loading, an answer or a
 download; **New chat** also clears the conversation.
+
+The assistant always starts closed, including with an older `ai.visible=1`
+setting. The keyboard shortcut is the only opening control; there are no
+assistant menu entries or toolbar buttons. The same shortcut closes the pane
+from its question box, preserving the conversation and returning focus to the
+editor. Configure its letter with
+`hotkey` in `GusekAI.ini` or `ai.hotkey` in SciTE properties.
 
 On first use, accept the model download when offered. The default base model
 and picture reader together require about 3.4 GB. Downloads resume after a

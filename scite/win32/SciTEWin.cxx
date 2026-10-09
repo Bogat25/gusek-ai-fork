@@ -278,7 +278,7 @@ void SciTEWin::ReadProperties() {
 	outputScroll = props.GetInt("output.scroll", 1);
 	ConfigureAiAssistant();
 	if (!firstPropertiesRead) {
-		aiVisible = props.GetInt("ai.visible", 0) != 0;
+		// The assistant always starts closed, including with legacy ai.visible=1.
 		int w = props.GetInt("ai.width", 0);
 		if (w >= 150) {
 			widthAiPane = w;
@@ -504,10 +504,6 @@ void SciTEWin::Command(WPARAM wParam, LPARAM lParam) {
 
 	case IDM_FULLSCREEN:
 		FullScreenToggle();
-		break;
-
-	case IDM_AIASSISTANT:
-		ToggleAiAssistant();
 		break;
 
 	case IDM_COPY:
@@ -2170,7 +2166,6 @@ void SciTEWin::ConfigureAiAssistant() {
         delete aiPane;
         aiPane = 0;
         aiVisible = false;
-        DestroyMenuItem(menuTools, IDM_AIASSISTANT);
     } else {
         if (!aiPane) {
             aiPane = new GusekAiPane(this);
@@ -2182,9 +2177,6 @@ void SciTEWin::ConfigureAiAssistant() {
                 return;
             }
         }
-        char shortcut[] = "Ctrl+Shift+T";
-        shortcut[11] = static_cast<char>(aiHotkey);
-        SetMenuItem(menuTools, IDM_AIASSISTANT, IDM_AIASSISTANT, "&AI assistant", shortcut);
     }
     SizeContentWindows();
     RedrawMenu();
@@ -2195,6 +2187,8 @@ void SciTEWin::ToggleAiAssistant() {
 	SetAssistantVisible(!aiVisible);
 	if (aiVisible && aiPane) {
 		aiPane->Show(true);
+	} else {
+		WindowSetFocus(wEditor);
 	}
 }
 
@@ -2335,8 +2329,9 @@ int SciTEWin::EventLoop() {
 		if (going) {
 			if (!ModelessHandler(&msg)) {
                 if (aiEnabled && msg.message == WM_KEYDOWN && msg.wParam == static_cast<WPARAM>(aiHotkey) &&
-                    GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_SHIFT) < 0) {
-                    ToggleAiAssistant();
+                    GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_SHIFT) < 0 &&
+                    !(GetKeyState(VK_MENU) < 0)) {
+                    if (!(msg.lParam & (1L << 30))) ToggleAiAssistant();
                     continue;
                 }
 				if (aiPane && aiVisible) {
