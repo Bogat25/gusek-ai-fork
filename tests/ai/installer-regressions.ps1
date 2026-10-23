@@ -1,6 +1,7 @@
-param([string]$BuildRoot, [string]$WorkRoot, [string]$RepoRoot)
+param([string]$BuildRoot, [string]$WorkRoot, [string]$RepoRoot, [switch]$Offline)
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+. (Join-Path $RepoRoot 'release\offline.ps1')
 function Assert([bool]$Condition,[string]$Message) {
     if (-not $Condition) { throw $Message }
     Write-Host "[PASS] $Message"
@@ -60,11 +61,14 @@ foreach ($functionName in @('Find-InnoSetup','Get-NumericVersion')) {
 function Stop-WithError([string]$Message) { throw $Message }
 $compiler = Find-InnoSetup
 if (-not $compiler) { throw 'Requested installer test needs Inno Setup.' }
-$production = Get-ChildItem -LiteralPath $Dist -Filter 'gusek-ai-*-setup.exe' |
+$pattern = if ($Offline) { 'gusek-ai-*-offline-setup.exe' } else { 'gusek-ai-*-setup.exe' }
+$production = Get-ChildItem -LiteralPath $Dist -Filter $pattern |
+    Where-Object { $Offline -or $_.Name -notlike '*-offline-setup.exe' } |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
 Assert ([bool]$production) 'Production installer exists.'
 $version = $production.BaseName.Substring('gusek-ai-'.Length)
 $version = $version.Substring(0,$version.Length - '-setup'.Length)
+if ($Offline) { $version = $version.Substring(0,$version.Length - '-offline'.Length) }
 Assert ($production.VersionInfo.FileVersion.Trim() -eq (Get-NumericVersion $version)) 'Installer metadata matches its version.'
 $checksum = ((Get-Content -LiteralPath ($production.FullName + '.sha256') -Raw) -split '\s+')[0]
 Assert ((Get-FileHash -LiteralPath $production.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $checksum) 'Published installer checksum matches.'
@@ -94,12 +98,17 @@ $arguments = @(
     "/DAppIdValue={$appId", "/DAppName=$name", "/DAiDataDir=$data",
     "/DStageDir=$Stage", "/DOutputDir=$outputDir", (Join-Path $RepoRoot 'packaging\gusek-ai.iss')
 )
+if ($Offline) {
+    $include = Get-OfflineInstallerArguments -CacheDirectory (Join-Path $BuildRoot 'cache') -OutputDirectory $caseRoot -ModelDestination '{#AiDataDir}\models'
+    $arguments = @($arguments[0..($arguments.Count-2)]) + @($include,$arguments[-1])
+}
 & $compiler @arguments *> (Join-Path $caseRoot 'compile.log')
 if ($LASTEXITCODE -ne 0) {
     Get-Content (Join-Path $caseRoot 'compile.log') -Tail 15
     throw 'Isolated installer compilation failed.'
 }
-$setup = Join-Path $outputDir 'gusek-ai-0.0.0-test-setup.exe'
+$suffix = if ($Offline) { '-offline' } else { '' }
+$setup = Join-Path $outputDir "gusek-ai-0.0.0-test$suffix-setup.exe"
 $uninstaller = Join-Path $itApp 'unins000.exe'
 $savedData = $env:GUSEK_AI_DATA
 $env:GUSEK_AI_DATA = $data
@@ -116,7 +125,14 @@ try {
                             'ai\llama\LICENSE-LLVM-OpenMP')) {
         Assert (Test-Path (Join-Path $itApp $relative)) "Installed component $relative exists."
     }
-    Assert (@(Get-ChildItem -LiteralPath $itApp -Filter '*.gguf' -Recurse).Count -eq 0) 'Installer includes no large model files.'
+    if ($Offline) {
+        Assert-InstalledModels -Directory (Join-Path $data 'models')
+        Assert $true 'Both offline models match their size and SHA-256 pins.'
+        & python (Join-Path $RepoRoot 'release\smoke-model.py') --server (Join-Path $itApp 'ai\llama\llama-server.exe') --models (Join-Path $data 'models') --log (Join-Path $caseRoot 'model-smoke.log')
+        if ($LASTEXITCODE -ne 0) { throw 'Installed model inference failed.' }
+    } else {
+        Assert (@(Get-ChildItem -LiteralPath $itApp -Filter '*.gguf' -Recurse).Count -eq 0) 'Slim installer excludes models.'
+    }
     Assert (Test-Path $registration) 'Separate per-user uninstall registration exists.'
     Assert (Test-Path $shortcut) 'Separate Start menu shortcut exists.'
     foreach ($machineKey in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\',
@@ -142,7 +158,9 @@ try {
     New-Item -ItemType Directory -Force -Path $modelDir,(Split-Path $notes) | Out-Null
     $owned = @('Qwen3.5-4B-Q4_K_M.gguf','Qwen3.5-4B-Q4_K_M.gguf.part',
                'Qwen3.5-4B-mmproj-F16.gguf','Qwen3.5-4B-mmproj-F16.gguf.part')
-    foreach ($file in $owned) { Set-Content -LiteralPath (Join-Path $modelDir $file) -Value 'owned fixture' }
+    foreach ($file in $owned) {
+        if (-not $Offline -or $file.EndsWith('.part')) { Set-Content -LiteralPath (Join-Path $modelDir $file) -Value 'owned fixture' }
+    }
     $custom = @('student-custom.gguf','student-custom.gguf.part')
     foreach ($file in $custom) { Set-Content -LiteralPath (Join-Path $modelDir $file) -Value 'custom fixture' }
     Set-Content -LiteralPath $notes -Value 'coursework fixture'
@@ -160,6 +178,7 @@ try {
     foreach ($file in ($owned + $custom)) {
         Assert (Test-Path (Join-Path $modelDir $file)) "Upgrade preserves $file."
     }
+    if ($Offline) { Assert-InstalledModels -Directory $modelDir }
 
     Run-Setup $uninstaller @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART')
     $uninstalled = $true

@@ -5,11 +5,12 @@ $probe = Join-Path $WorkRoot 'wrapper probe with spaces'
 New-Item -ItemType Directory -Force -Path (Join-Path $probe 'tests\ai') | Out-Null
 Copy-Item (Join-Path $RepoRoot 'gusek.ps1') $probe
 Copy-Item (Join-Path $RepoRoot 'gusek.cmd') $probe
+Copy-Item (Join-Path $RepoRoot 'release') $probe -Recurse
 $requestedRoot = Join-Path $WorkRoot 'requested-build-root'
 $scriptPath = Join-Path $probe 'tests\ai\run-tests.ps1'
 foreach ($expectedExit in @(1,0)) {
     $body = @'
-param([switch]$Real,[switch]$Gui,[switch]$Installer,[string]$BuildRoot='D:\gusek-build')
+param([switch]$Real,[switch]$Gui,[switch]$Installer,[switch]$Offline,[string]$BuildRoot='D:\gusek-build')
 Set-Content -LiteralPath (Join-Path $PSScriptRoot 'received-root.txt') -Value $BuildRoot
 exit EXPECTED_EXIT
 '@

@@ -24,6 +24,11 @@
 #ifndef OutputDir
   #define OutputDir "."
 #endif
+#ifdef OfflineModelsInclude
+  #define InstallerSuffix "-offline"
+#else
+  #define InstallerSuffix ""
+#endif
 
 [Setup]
 AppId={#AppIdValue}
@@ -41,7 +46,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.18362
 OutputDir={#OutputDir}
-OutputBaseFilename=gusek-ai-{#AppVersion}-setup
+OutputBaseFilename=gusek-ai-{#AppVersion}{#InstallerSuffix}-setup
 UninstallDisplayIcon={app}\gusek.exe
 UninstallDisplayName={#AppName} {#AppVersion}
 LicenseFile={#StageDir}\README
@@ -75,3 +80,7 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\gusek.exe"; WorkingDir: "{app
 
 [Run]
 Filename: "{app}\gusek.exe"; WorkingDir: "{app}"; Description: "Launch GUSEK now"; Flags: postinstall nowait skipifsilent
+
+#ifdef OfflineModelsInclude
+  #include OfflineModelsInclude
+#endif

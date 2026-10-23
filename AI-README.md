@@ -23,7 +23,8 @@ from its question box, preserving the conversation and returning focus to the
 editor. Configure its letter with
 `hotkey` in `GusekAI.ini` or `ai.hotkey` in SciTE properties.
 
-On first use, accept the model download when offered. The default base model
+The complete SourceForge offline installer includes both models. With a slim
+installer or portable ZIP, accept the first-use download when offered. The default base model
 and picture reader together require about 3.4 GB. Downloads resume after a
 pause and must match the configured SHA-256 before use. Chat runs through a
 local CPU server on `127.0.0.1:28713`, independently of RGui and RStudio. After
@@ -115,8 +116,8 @@ runtime even when the caller has a `DEBUG` environment variable.
 The checked-in `.github/workflows/windows-installer.yml` runs when the owner
 pushes a version tag such as `v0.1.1` or `v0.2.0-rc1`. It validates the tag,
 fetches pinned tools, builds the editor, runs native and GUI regressions,
-creates both packages and checks installation, upgrade and uninstall. Models
-are downloaded on first use and are excluded from the release packages.
+creates both packages and checks installation, upgrade and uninstall. The complete installer includes both models and is published on SourceForge.
+The optional portable ZIP remains slim. See [SourceForge setup](release/SOURCEFORGE.md).
 
 After those checks, a separate job verifies the package checksums and creates
 a GitHub release with the installer, portable ZIP and their `.sha256` files.

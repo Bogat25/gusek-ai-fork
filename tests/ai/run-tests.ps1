@@ -10,6 +10,7 @@ param(
     [switch]$Real,
     [switch]$Gui,
     [switch]$Installer,
+    [switch]$Offline,
     [string]$BuildRoot = 'D:\gusek-build'
 )
 Set-StrictMode -Version 2.0
@@ -118,7 +119,7 @@ try {
     }
 
     if ($Installer) {
-        & (Join-Path $PSScriptRoot 'installer-regressions.ps1') -BuildRoot $BuildRoot -WorkRoot $Work -RepoRoot $Repo
+        & (Join-Path $PSScriptRoot 'installer-regressions.ps1') -BuildRoot $BuildRoot -WorkRoot $Work -RepoRoot $Repo -Offline:$Offline
         if ($LASTEXITCODE -ne 0) { throw 'Installer regressions failed.' }
         $package = Get-ChildItem -LiteralPath (Join-Path $BuildRoot 'dist') -Filter 'gusek-*-portable.zip' |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1

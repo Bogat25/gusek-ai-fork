@@ -23,7 +23,7 @@
         dev       quick, then run
         test      run tests (-Real, -Gui, -Installer)
         package   assemble portable ZIP in dist
-        installer build Inno Setup installer
+        installer build Inno Setup installer (-Offline includes both models)
         clean     clean build tree and outputs
 #>
 [CmdletBinding()]
@@ -44,6 +44,7 @@ param(
 
     # Skip downloading multi-GB models in fetch
     [switch]$NoModel,
+    [switch]$Offline,
 
     # Test switches
     [switch]$Real,
@@ -71,15 +72,18 @@ $LlamaZip    = 'llama-b11153-bin-win-cpu-x64.zip'
 $LlamaUrl    = "https://github.com/ggml-org/llama.cpp/releases/download/b11153/$LlamaZip"
 $LlamaSha256 = '569d19826f3fb00a3fc2df7bd68ab9ad33e5c0d6d69ce022b24372700cee7931'
 
-$ModelFile   = 'Qwen3.5-4B-Q4_K_M.gguf'
-$ModelUrl    = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/$ModelFile"
-$ModelSha256 = '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4'
-$ModelSize   = 2740937888
+$AssetSpec = Get-Content (Join-Path $PSScriptRoot 'release\assets.json') -Raw | ConvertFrom-Json
+. (Join-Path $PSScriptRoot 'release\offline.ps1')
+if ($Offline -and $NoModel) { throw '-Offline and -NoModel cannot be combined.' }
+$ModelFile   = $AssetSpec.assets[0].name
+$ModelUrl    = "https://huggingface.co/$($AssetSpec.repository)/resolve/$($AssetSpec.revision)/$($AssetSpec.assets[0].remote)"
+$ModelSha256 = $AssetSpec.assets[0].sha256
+$ModelSize   = [long]$AssetSpec.assets[0].bytes
 
-$VisionFile   = 'Qwen3.5-4B-mmproj-F16.gguf'
-$VisionUrl    = 'https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf'
-$VisionSha256 = 'cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864'
-$VisionSize   = 672423616
+$VisionFile   = $AssetSpec.assets[1].name
+$VisionUrl    = "https://huggingface.co/$($AssetSpec.repository)/resolve/$($AssetSpec.revision)/$($AssetSpec.assets[1].remote)"
+$VisionSha256 = $AssetSpec.assets[1].sha256
+$VisionSize   = [long]$AssetSpec.assets[1].bytes
 
 $InnoFile = 'innosetup-7.1.0-x64.exe'
 $InnoUrl = "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/$InnoFile"
@@ -526,31 +530,32 @@ function Do-Installer {
 
     New-Item -ItemType Directory -Force -Path $Dist | Out-Null
     Say "Compiling Inno Setup installer using $iscc..."
-    $proc = Start-Process -FilePath $iscc -ArgumentList @(
+    $offlineArguments = @()
+    if ($Offline) {
+        $offlineArguments = @(Get-OfflineInstallerArguments -CacheDirectory $Cache -OutputDirectory (Join-Path $BuildRoot 'offline') -ModelDestination '{#AiDataDir}\models')
+    }
+    $arguments = @(
         "/DAppVersion=$Version",
         "/DNumericVersion=$numericVersion",
         "/DStageDir=`"$Stage`"",
-        "/DOutputDir=`"$Dist`"",
-        "`"$iss`""
-    ) -Wait -PassThru -NoNewWindow
+        "/DOutputDir=`"$Dist`""
+    ) + @($offlineArguments | ForEach-Object { '"{0}"' -f $_ }) + @("`"$iss`"")
+    $proc = Start-Process -FilePath $iscc -ArgumentList $arguments -Wait -PassThru -NoNewWindow
 
     if ($proc.ExitCode -ne 0) {
         Stop-WithError "ISCC compilation failed with code $($proc.ExitCode)"
     }
 
-    $setupExe = Join-Path $Dist ("gusek-ai-{0}-setup.exe" -f $Version)
+    $suffix = if ($Offline) { '-offline' } else { '' }
+    $setupExe = Join-Path $Dist ("gusek-ai-{0}{1}-setup.exe" -f $Version,$suffix)
     if (Test-Path $setupExe) {
+        Assert-InstallerSize -Path $setupExe
         $sha = (Get-FileHash -Algorithm SHA256 $setupExe).Hash.ToLowerInvariant()
         Set-Content -Path "$setupExe.sha256" -Value "$sha *$((Get-Item $setupExe).Name)" -Encoding ASCII
         Say "Installer ready: $setupExe"
         Note "Installer SHA256: $sha"
     } else {
-        $any = Get-ChildItem $Dist -Filter "gusek-ai-*-setup.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($any) {
-            $sha = (Get-FileHash -Algorithm SHA256 $any.FullName).Hash.ToLowerInvariant()
-            Set-Content -Path "$($any.FullName).sha256" -Value "$sha *$($any.Name)" -Encoding ASCII
-            Say "Installer ready: $($any.FullName)"
-        }
+        Stop-WithError 'The compiler returned success without producing the requested installer.'
     }
 }
 
@@ -567,7 +572,7 @@ switch ($Command) {
     'test'      {
         if (Test-Path (Join-Path $Repo 'tests\ai\run-tests.ps1')) {
             $global:LASTEXITCODE = 0
-            & (Join-Path $Repo 'tests\ai\run-tests.ps1') -BuildRoot $BuildRoot -Real:$Real -Gui:$Gui -Installer:$Installer
+            & (Join-Path $Repo 'tests\ai\run-tests.ps1') -BuildRoot $BuildRoot -Real:$Real -Gui:$Gui -Installer:$Installer -Offline:$Offline
             exit $LASTEXITCODE
         } else {
             Note "Running unit checks..."

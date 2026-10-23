@@ -13,13 +13,13 @@ mirrors source into BuildRoot before invoking the native makefiles.
 
 ```powershell
 .\gusek.cmd doctor -BuildRoot C:\gusek-build
-.\gusek.cmd fetch -NoModel -BuildRoot C:\gusek-build
+.\gusek.cmd fetch -BuildRoot C:\gusek-build
 .\gusek.cmd full -BuildRoot C:\gusek-build
 ```
 
 `fetch -NoModel` downloads the pinned CPU runtime and per-user Inno Setup compiler
 with integrity verification. Without `-NoModel`, it also prepares the base model
-and projector. Pins are in [gusek.ps1](../gusek.ps1) and the
+and projector. Model pins are in [release/assets.json](../release/assets.json) and the
 [default configuration](../ai/defaults/GusekAI.ini).
 
 The full build compiles Scintilla and SciTE from this repository. No untracked
@@ -39,7 +39,7 @@ profile. Builds explicitly select the release runtime, regardless of an inherite
 ```powershell
 .\gusek.cmd test -BuildRoot C:\gusek-build
 .\gusek.cmd test -Real -BuildRoot C:\gusek-build
-.\gusek.cmd test -Installer -BuildRoot C:\gusek-build
+.\gusek.cmd test -Installer -Offline -BuildRoot C:\gusek-build
 ```
 
 | Suite | What it exercises |
@@ -63,14 +63,15 @@ Evidence is retained in `BuildRoot/tests/run-*` and build logs under `logs`.
 
 ```powershell
 .\gusek.cmd package -Version 0.1.0 -BuildRoot C:\gusek-build
-.\gusek.cmd installer -Version 0.1.0 -BuildRoot C:\gusek-build
+.\gusek.cmd installer -Offline -Version 0.1.0 -BuildRoot C:\gusek-build
 ```
 
 These produce `dist/gusek-<version>-portable.zip` and
-`dist/gusek-ai-<version>-setup.exe`, with adjacent `.sha256` files. The payload
+`dist/gusek-ai-<version>-offline-setup.exe`, with adjacent `.sha256` files. The payload
 includes the built editor, solver assets, CPU runtime, defaults, documentation,
-and licenses. Model weights, partial downloads, work profiles, and test logs
-are excluded. Build current source before packaging.
+and licenses. `installer -Offline` adds both verified models. Portable ZIPs
+remain slim; work profiles, partial downloads, and test logs are excluded.
+See [SourceForge setup](../release/SOURCEFORGE.md) for automatic publishing. Build current source before packaging.
 
 The installer uses `PrivilegesRequired=lowest`. Its identity is distinct from
 the other forks. Portable use requires `Start-Gusek.cmd`; installed shortcuts

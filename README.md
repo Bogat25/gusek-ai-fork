@@ -24,18 +24,19 @@ GUSEK, GLPK, SciTE, or Scintilla release. Original notices and licenses remain.
 
 The default assistant runs **Qwen3.5-4B Q4_K_M** and its multimodal projector
 through **llama.cpp on the CPU**. The packaged application requires no cloud AI
-account, API key, GPU, Node, or Python installation for normal use. Initial
-model downloads need Internet access; inference works offline afterward.
+account, API key, GPU, Node, or Python installation for normal use. Slim packages need Internet access
+for initial model downloads; the complete offline installer includes those files.
 
 ## Install and start
 
-1. Download `gusek-ai-<version>-setup.exe` or
+1. Download `gusek-ai-<version>-offline-setup.exe` through the SourceForge link or
    `gusek-<version>-portable.zip` from a successful release in this repository,
    when available. Compare its SHA-256 against the adjacent checksum file.
 2. Run the installer, or extract the portable ZIP into a writable folder and
    start `Start-Gusek.cmd`. The installer installs for the current user.
 3. Press **Ctrl+Shift+T** to open or close the assistant.
-4. Accept the initial model/picture-reader download, about **3.4 GB** combined.
+4. The offline installer includes both models. Portable and slim packages offer
+   their initial download, about **3.4 GB** combined.
 5. Enter a question and select **Send** or **Ctrl+Enter**. Use **Stop** to cancel
    loading, generation, or downloading.
 
@@ -70,17 +71,19 @@ Install Visual Studio C++ tools and Python 3, then run from this checkout:
 
 ```powershell
 .\gusek.cmd doctor -BuildRoot C:\gusek-build
-.\gusek.cmd fetch -NoModel -BuildRoot C:\gusek-build
+.\gusek.cmd fetch -BuildRoot C:\gusek-build
 .\gusek.cmd full -BuildRoot C:\gusek-build
 .\gusek.cmd test -BuildRoot C:\gusek-build
 .\gusek.cmd package -Version 0.1.0 -BuildRoot C:\gusek-build
-.\gusek.cmd installer -Version 0.1.0 -BuildRoot C:\gusek-build
+.\gusek.cmd installer -Offline -Version 0.1.0 -BuildRoot C:\gusek-build
 ```
 
 `0.1.0` is an example fork version. BuildRoot must be a writable absolute path
 outside the checkout, without spaces. MSVC discovery supports installed editions
 through vswhere; `-VcVars` is an explicit override. Omit `-NoModel` when fetching
-to prepare real inference tests. Models are excluded from release packages.
+to prepare real inference tests. `installer -Offline` bundles both models;
+portable ZIPs and slim installers omit them.
+See [SourceForge release setup](release/SOURCEFORGE.md) for automatic publishing.
 
 ## Documentation
 

@@ -1,6 +1,8 @@
 # GUSEK AI release validation
 
-Current status (2026-10-09): the shortcut-only changes build successfully.
+Current status (2026-10-23): the complete offline installer, installed model
+inference, upgrade/uninstall and portable checks passed. See the section below.
+Previous status (2026-10-09): the shortcut-only changes build successfully.
 Fresh native tests (88/88), build/release helper checks and all 127 staged GUI
 assertions passed. Clipboard screenshot payload checks now pass; real-model
 screenshot inference and installed/portable checks were not rerun in this pass.
@@ -8,6 +10,28 @@ See **Shortcut-only assistant access (2026-10-09)** for current evidence.
 The [current documentation](docs/README.md) describes this independent hard fork.
 Evidence paths are expressed as local build/audit-root placeholders for public
 documentation; no original logs, user profiles, or clipboard data are published.
+
+## Complete offline installers and SourceForge (2026-10-23)
+
+The native release build and portable package were rebuilt locally. The complete
+offline installer compiled to **3,427,062,564 bytes**, below the shared
+4,100,000,000-byte release budget. It includes the pinned text model, picture
+reader, CPU runtime and model license.
+
+`gusek.cmd test -Installer -Offline` passed: **88 native checks**, build/helper
+regressions, installed and relocated portable launch checks, and **127 staged
+GUI assertions**. A separate installer identity and model-data directory were
+used for installation, upgrade and uninstall. Both installed model hashes and
+real CPU text/picture inference passed. Upgrades retained user settings, prompts
+and notes; uninstall removed distribution-owned models and retained custom
+models, notes, settings and history.
+
+The shared publisher regressions check verification before default selection,
+separate prereleases, retention, failure recovery and credential-safe errors.
+The public SourceForge SSH host fingerprint was verified. Authenticated upload,
+default-download selection and remote pruning remain untested until the account,
+projects and GitHub environment are configured. No hosted workflow was triggered
+and no remote release was published.
 
 Date: 2026-10-05. Reviewed baseline: `b46d8b05d11801410a41001d0031a4d02b0bee7f`, plus the changes in this commit.
 

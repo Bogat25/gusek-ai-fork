@@ -1,55 +1,44 @@
-# Windows installer and portable releases
+# Windows offline installer releases
 
-Fork package versions are independent of the legacy GUSEK, SciTE, and GLPK
-version numbers. Use the same fork version for the tag, installer, and ZIP.
+GUSEK AI uses the shared [SourceForge release infrastructure](../release/SOURCEFORGE.md).
+Complete the one-time account, project, SSH-key and GitHub environment setup
+in that guide before publishing a new version tag.
 
-[windows-installer.yml](../.github/workflows/windows-installer.yml) runs on
-version-tag pushes such as `v0.1.0`, `0.1.0`, and `v0.2.0-rc1`, and supports manual
-dispatch. The workflow must be committed at the tagged revision. A local tag
-alone does not trigger GitHub; the owner must publish it.
+The [Windows workflow](../.github/workflows/windows-installer.yml) builds the tagged source, fetches both pinned
+models, creates the complete offline installer, and runs the repository checks.
+The installer suite verifies model hashes, local text/picture inference,
+application launch, upgrade preservation and uninstall under a separate identity.
+A serialized Linux publisher verifies the public SourceForge copies before
+selecting the stable Windows default and pruning older files in that channel.
+Prereleases use their own channel and never replace the stable default.
 
-## Pipeline
+GitHub releases contain SourceForge download links and the small checksum file.
+The multi-GB installer is hosted on SourceForge. Installer Actions artifacts
+expire after one day; diagnostic logs have separate retention. SourceForge
+credentials are confined to the `sourceforge` GitHub environment.
 
-1. Validate the version, fetch verified CPU/compiler assets, and build
-   Scintilla/GUSEK from source.
-2. Run native, wrapper, and actual GUI regressions without multi-GB models.
-3. Build the installer, portable ZIP, and checksums.
-4. Verify isolated per-user install, launch, upgrade, uninstall, and portable use.
-5. For tag pushes, verify checksums again, upload the complete asset set to a
-   draft GitHub release, and publish it. Suffix versions become prereleases.
-
-Manual runs create downloadable Actions artifacts without publishing a release.
-Existing releases are not overwritten. An interrupted draft may require owner
-cleanup before retrying. Build jobs have read-only repository permissions; only
-the tag publisher has release-write permission and uses GitHub's job token.
-
-## Before tagging
-
-Commit the intended source/workflow changes, run default and real-model checks,
-build the intended version, and run installer checks without elevation. Resolve
-or explicitly disclose the clipboard verification gap in [VALIDATION.md](../VALIDATION.md).
-Inspect model exclusions, notices, private data, version metadata, and checksums.
-Record the actual suite results, including skips and failures.
-
-Rerunning a failed job uses the same tagged source; later source fixes require a
-new tag. Do not move a public release tag silently. A locally passing pipeline
-is separate from the status of a hosted run.
-
-## Assets
-
-- `gusek-ai-<version>-setup.exe`: per-user installer, no administrator prompt.
-- `gusek-<version>-portable.zip`: extract into a writable folder and use
-  `Start-Gusek.cmd`.
-- Adjacent `.sha256` files for both assets.
-
-Model weights are downloaded on first use and are absent from both packages.
-The current release is unsigned. Compare downloads with their checksums:
+## Local packaging
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\gusek-ai-0.1.0-setup.exe
-Get-Content .\gusek-ai-0.1.0-setup.exe.sha256
+.\gusek.cmd fetch -BuildRoot D:\gusek-build
+.\gusek.cmd full -BuildRoot D:\gusek-build
+.\gusek.cmd installer -Offline -Version 0.2.0 -BuildRoot D:\gusek-build
+.\gusek.cmd test -Installer -Offline -BuildRoot D:\gusek-build
 ```
 
-Checksums detect corruption or mismatched files; they do not replace a trusted
-download source or code signing. See [BUILDING.md](BUILDING.md) for local commands
-and [THIRD-PARTY.md](../THIRD-PARTY.md) for source and license provenance.
+Use the same fork version for the tag and installer, with three numeric
+components. A suffix such as `-rc.1` denotes a prerelease.
+The complete installer is named `gusek-ai-<version>-offline-setup.exe`.
+Omit `-Offline` for the smaller first-use-download installer. GUSEK's optional
+portable ZIP stays slim and can remain a GitHub release asset.
+
+Before tagging, review the actual local validation, licenses and checksums.
+A locally passing build is separate from a successful hosted publication.
+The owner pushes the committed changes and a new unique tag; a local tag alone
+does not trigger the workflow. A rerun uses the tagged source. Use a new version
+for changed bytes rather than moving a published tag or overwriting a release.
+
+Packages are currently unsigned. Offline installers require no additional model
+download, but inherited application features and user code may still use the
+network. Settings, notes, and custom models are preserved by upgrades and
+uninstall; the two pinned default models belong to the distribution.

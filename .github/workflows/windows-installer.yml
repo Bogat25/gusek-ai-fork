@@ -22,7 +22,7 @@ env:
 jobs:
   build:
     runs-on: windows-2025
-    timeout-minutes: 60
+    timeout-minutes: 120
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
@@ -42,6 +42,13 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           RUN_NUMBER: ${{ github.run_number }}
         run: .\scripts\release-version.ps1 -RefType $env:REF_TYPE -RefName $env:REF_NAME -RunNumber $env:RUN_NUMBER
+      - name: Test release infrastructure
+        shell: pwsh
+        run: |
+          python -m unittest discover -s release -p 'test_*.py' -v
+          if ($LASTEXITCODE -ne 0) { throw 'Release publisher regressions failed.' }
+          .\release\test-offline.ps1
+
 
       - name: Cache pinned downloads and compiler
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -49,11 +56,11 @@ jobs:
           path: |
             ${{ env.BUILD_ROOT }}\cache
             ${{ env.BUILD_ROOT }}\tools\innosetup
-          key: gusek-tools-${{ hashFiles('gusek.ps1') }}
+          key: gusek-tools-${{ hashFiles('gusek.ps1', 'release/assets.json') }}
           restore-keys: gusek-tools-
 
       - name: Fetch pinned llama.cpp and per-user Inno Setup
-        run: .\gusek.cmd fetch -NoModel -BuildRoot $env:BUILD_ROOT
+        run: .\gusek.cmd fetch -BuildRoot $env:BUILD_ROOT
 
       - name: Build GUSEK and Scintilla
         run: .\gusek.cmd full -BuildRoot $env:BUILD_ROOT
@@ -67,54 +74,24 @@ jobs:
         run: |
           .\gusek.cmd package -Version $env:VERSION -BuildRoot $env:BUILD_ROOT
           if ($LASTEXITCODE -ne 0) { throw 'Portable packaging failed.' }
-          .\gusek.cmd installer -Version $env:VERSION -BuildRoot $env:BUILD_ROOT
+          .\gusek.cmd installer -Offline -Version $env:VERSION -BuildRoot $env:BUILD_ROOT
           if ($LASTEXITCODE -ne 0) { throw 'Installer packaging failed.' }
 
       - name: Verify per-user install, GUI, upgrade and uninstall
-        run: .\gusek.cmd test -Installer -BuildRoot $env:BUILD_ROOT
-
-      - name: Write release notes
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          COMMIT: ${{ github.sha }}
-        run: |
-          $installer = "gusek-ai-$env:VERSION-setup.exe"
-          $portable = "gusek-$env:VERSION-portable.zip"
-          $checksum = (Get-FileHash -LiteralPath "$env:BUILD_ROOT\dist\$installer" -Algorithm SHA256).Hash.ToLowerInvariant()
-          @"
-          GUSEK with a local MathProg / GLPK assistant. Open **Tools > AI assistant**
-          or press **Ctrl+Shift+T**.
-
-          Download **$installer** for Windows 11 x64 (also supports Windows 10 1903+).
-          Installation is for the current user and does not request administrator
-          permissions. The default folder is LocalAppData\Programs\GUSEK AI.
-          **$portable** runs from an extracted folder or USB drive using Start-Gusek.cmd.
-
-          The packages contain the CPU runtime and exclude the large models.
-          First use offers the verified Qwen3.5-4B model and picture reader download
-          (about 3.4 GB). Subsequent use works offline. Course notes and prompts stay local;
-          generated code is inserted only when requested and is never executed automatically.
-
-          This build is unsigned. Windows reputation checks may still display a warning;
-          that is separate from administrator elevation.
-
-          SHA-256 ($installer): $checksum
-          Built from $env:COMMIT. Source is available in this tag's source archive.
-          "@ | Set-Content -LiteralPath "$env:BUILD_ROOT\dist\release-notes.md" -Encoding utf8
+        run: .\gusek.cmd test -Installer -Offline -BuildRoot $env:BUILD_ROOT
 
       - name: Upload tested release files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gusek-windows-release
           path: |
-            ${{ env.BUILD_ROOT }}\dist\gusek-ai-*-setup.exe
-            ${{ env.BUILD_ROOT }}\dist\gusek-ai-*-setup.exe.sha256
-            ${{ env.BUILD_ROOT }}\dist\gusek-*-portable.zip
-            ${{ env.BUILD_ROOT }}\dist\gusek-*-portable.zip.sha256
-            ${{ env.BUILD_ROOT }}\dist\release-notes.md
+            ${{ env.BUILD_ROOT }}\dist\gusek-ai-${{ steps.version.outputs.version }}-offline-setup.exe
+            ${{ env.BUILD_ROOT }}\dist\gusek-ai-${{ steps.version.outputs.version }}-offline-setup.exe.sha256
+            ${{ env.BUILD_ROOT }}\dist\gusek-${{ steps.version.outputs.version }}-portable.zip
+            ${{ env.BUILD_ROOT }}\dist\gusek-${{ steps.version.outputs.version }}-portable.zip.sha256
           compression-level: 0
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 1
 
       - name: Upload diagnostic logs on failure
         if: failure()
@@ -126,38 +103,68 @@ jobs:
             ${{ env.BUILD_ROOT }}\tests\run-*/**/*.log
             ${{ env.BUILD_ROOT }}\tests\run-*/**/status.txt
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 7
+
 
   release:
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 120
+    environment: sourceforge
+    concurrency:
+      group: sourceforge-release
+      cancel-in-progress: false
     permissions:
       contents: write
+    env:
+      SOURCEFORGE_PROJECT: ${{ vars.SOURCEFORGE_PROJECT }}
+      SOURCEFORGE_USERNAME: ${{ vars.SOURCEFORGE_USERNAME }}
+      SOURCEFORGE_SSH_KEY: ${{ secrets.SOURCEFORGE_SSH_KEY }}
+      SOURCEFORGE_API_KEY: ${{ secrets.SOURCEFORGE_API_KEY }}
     steps:
+      - name: Check out the release publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Download tested release files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: gusek-windows-release
           path: dist
-
-      - name: Verify checksums and publish release
-        shell: bash
+      - name: Write release notes
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          python3 - "$VERSION" <<'PY'
+          import hashlib, pathlib, sys
+          version = sys.argv[1]
+          file = pathlib.Path('dist/gusek-ai-' + version + '-offline-setup.exe')
+          with file.open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          pathlib.Path('dist/release-notes.md').write_text(
+              'GUSEK AI for Windows x64.\n\n'
+              'The complete per-user installer includes the application, CPU runtime, '
+              'Qwen3.5-4B model, and picture reader. No model download is required after installation.\n\n'
+              'This build is unsigned.\n\nSHA-256: ' + digest + '\n', encoding='utf-8')
+          PY
+      - name: Publish the complete offline installer
+        uses: ./.github/actions/sourceforge
+        with:
+          artifact: dist/gusek-ai-${{ needs.build.outputs.version }}-offline-setup.exe
+          notes: dist/release-notes.md
+          version: ${{ needs.build.outputs.version }}
+      - name: Publish GitHub release notes and checksums
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           VERSION: ${{ needs.build.outputs.version }}
-          PRERELEASE: ${{ needs.build.outputs.prerelease }}
         run: |
           set -euo pipefail
-          cd dist
-          sed -i 's/\r$//' -- *.sha256
-          sha256sum --check --strict -- *.sha256
           flags=()
-          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease --latest=false); fi
+          if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease --latest=false); fi
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
-            --title "GUSEK AI $VERSION" --notes-file release-notes.md \
-            "${flags[@]}" "gusek-ai-$VERSION-setup.exe" "gusek-ai-$VERSION-setup.exe.sha256" \
-            "gusek-$VERSION-portable.zip" "gusek-$VERSION-portable.zip.sha256"
+            --title "GUSEK AI $VERSION" --notes-file dist/release-notes-sourceforge.md \
+            "${flags[@]}" "dist/gusek-ai-$VERSION-offline-setup.exe.sha256" \
+            "dist/gusek-$VERSION-portable.zip" "dist/gusek-$VERSION-portable.zip.sha256"
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false "${flags[@]}"
