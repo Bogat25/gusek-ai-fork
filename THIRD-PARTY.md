@@ -18,8 +18,10 @@ against the SHA-256 pin in `gusek.ps1`. Its MIT notice is included as
 The runtime archive's LLVM OpenMP notice is retained as
 `ai/llama/LICENSE-LLVM-OpenMP`.
 
-Model files are excluded from both packages. The default downloads are the
-Qwen3.5-4B Q4_K_M model and F16 multimodal projector; their URLs, sizes and
-SHA-256 pins are recorded in `ai/defaults/GusekAI.ini` and `gusek.ps1`.
-Model documentation and notices are provided by the upstream repositories at
-those URLs.
+The complete offline installer includes the Qwen3.5-4B Q4_K_M model and F16
+multimodal projector, with their Apache 2.0 license installed as
+`licenses/Qwen3.5-4B-LICENSE.txt`. Slim installers and portable ZIPs omit model
+files and offer a verified download. The model revision, sizes and SHA-256 pins
+are recorded in `release/assets.json`; runtime download settings are in
+`ai/defaults/GusekAI.ini`. Upstream model documentation is available from the
+repository named in that manifest.
